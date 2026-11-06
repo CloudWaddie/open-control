@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -24,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwaddie/opencontrol/internal/egress"
 	"github.com/cloudwaddie/opencontrol/internal/store"
 	"github.com/cloudwaddie/opencontrol/internal/web"
 )
@@ -41,14 +43,16 @@ var roleRank = map[string]int{"viewer": 1, "operator": 2, "admin": 3}
 
 // Server holds the dependencies of the control API.
 type Server struct {
-	db     *sql.DB
-	reload func() // asks the resolver to recompile its snapshot
+	db      *sql.DB
+	reload  func()           // asks the resolver to recompile its snapshot
+	checker *egress.Checker // probes exit nodes on demand; nil disables /check
 }
 
 // Handler returns the API mux plus the embedded UI. reload is called after
-// every committed write so changes take effect without a restart.
-func Handler(db *sql.DB, reload func()) http.Handler {
-	s := &Server{db: db, reload: reload}
+// every committed write so changes take effect without a restart. checker may
+// be nil, in which case the on-demand exit check endpoint reports 501.
+func Handler(db *sql.DB, reload func(), checker *egress.Checker) http.Handler {
+	s := &Server{db: db, reload: reload, checker: checker}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +77,11 @@ func Handler(db *sql.DB, reload func()) http.Handler {
 
 	mux.Handle("GET /api/v1/logs", s.require("viewer", s.listLogs))
 	mux.Handle("GET /api/v1/stats", s.require("viewer", s.stats))
+
+	mux.Handle("GET /api/v1/exits", s.require("viewer", s.listExits))
+	mux.Handle("POST /api/v1/exits", s.require("operator", s.createExit))
+	mux.Handle("DELETE /api/v1/exits/{id}", s.require("operator", s.deleteExit))
+	mux.Handle("POST /api/v1/exits/{id}/check", s.require("operator", s.checkExit))
 
 	mux.Handle("GET /api/v1/audit", s.require("admin", s.listAudit))
 	mux.Handle("GET /api/v1/tokens", s.require("admin", s.listTokens))
@@ -220,9 +229,13 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 		Matcher string `json:"matcher"`
 		Pattern string `json:"pattern"`
 		Answer  string `json:"answer"`
+		ExitID  int64  `json:"exit_id"` // redirect rules: the exit to send matches to
 	}
 	if !decode(w, r, &in) {
 		return
+	}
+	if in.Kind == "redirect" {
+		in.Answer = strconv.FormatInt(in.ExitID, 10)
 	}
 	s.mutate(w, r, "rule.create", func(tx *sql.Tx, org int64) (result, error) {
 		id, err := store.AddRule(tx, org, profileID, in.Kind, in.Matcher, in.Pattern, in.Answer)
@@ -363,9 +376,85 @@ func (s *Server) deleteBlocklist(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- exit nodes (M5) ---
+
+func (s *Server) listExits(w http.ResponseWriter, r *http.Request) {
+	out, err := store.ListExitNodes(s.db, principalOf(r).org)
+	respond(w, out, err)
+}
+
+func (s *Server) createExit(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name     string `json:"name"`
+		Kind     string `json:"kind"`
+		Address  string `json:"address"`
+		AnswerIP string `json:"answer_ip"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	s.mutate(w, r, "exit.create", func(tx *sql.Tx, org int64) (result, error) {
+		id, err := store.AddExitNode(tx, org, in.Name, in.Kind, in.Address, in.AnswerIP)
+		if err != nil {
+			return result{}, err
+		}
+		return result{
+			target: in.Name + " (" + in.Kind + ")",
+			status: http.StatusCreated,
+			body: store.ExitNode{ID: id, Name: in.Name, Kind: in.Kind, Address: in.Address,
+				AnswerIP: in.AnswerIP, Health: "unknown"},
+		}, nil
+	})
+}
+
+// deleteExit also removes the redirect rules that pointed at the exit, and
+// reports how many were removed.
+func (s *Server) deleteExit(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	s.mutate(w, r, "exit.delete", func(tx *sql.Tx, org int64) (result, error) {
+		removed, err := store.DeleteExitNode(tx, org, id)
+		if err != nil {
+			return result{}, err
+		}
+		return result{
+			target: fmt.Sprintf("exit %d (%d redirect rules removed)", id, removed),
+			status: http.StatusOK,
+			body:   map[string]any{"deleted": id, "removed_rules": removed},
+		}, nil
+	})
+}
+
+// checkExit probes an exit right now instead of waiting for the next round.
+func (s *Server) checkExit(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if s.checker == nil {
+		writeErr(w, http.StatusNotImplemented, "exit checks are not enabled")
+		return
+	}
+	org := principalOf(r).org
+	ex, err := store.GetExitNode(s.db, org, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "exit not found")
+		return
+	}
+	health, err := s.checker.CheckRecord(store.ExitRecord{ExitNode: ex, Org: org})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ex.Health = health
+	writeJSON(w, http.StatusOK, ex)
+}
+
 // --- query log (M4) ---
 
-var logActions = map[string]bool{"block": true, "forward": true, "rewrite": true, "refused": true, "error": true}
+var logActions = map[string]bool{"block": true, "forward": true, "rewrite": true, "redirect": true, "refused": true, "error": true}
 
 // listLogs returns the org's newest decisions. ?after=<id> returns only newer
 // rows, which is how the UI tails the log.

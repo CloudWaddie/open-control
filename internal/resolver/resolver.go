@@ -127,6 +127,16 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 	q := req.Question[0]
 	key := cache.MakeKey(req)
 
+	// fallback records why a redirect was not applied (exit down), so the
+	// forwarded answer's log line says so.
+	fallback := ""
+	forwardReason := func(s string) string {
+		if fallback != "" {
+			return fallback
+		}
+		return s
+	}
+
 	// Policy (M1/M3): identify the endpoint → profile → decision.
 	if snap := r.snapshot.Load(); snap != nil {
 		var prof *policy.Profile
@@ -168,15 +178,21 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 				v.action, v.reason = "rewrite", d.Target
 				return rewriteReply(req, q, d.Target)
 			case policy.ActionRedirect:
-				// Egress phase (PLAN.md M5): forward until exits exist.
-				log.Printf("resolver: REDIRECT %s stubbed (%s), forwarding", q.Name, d.Reason)
+				if d.ExitHealthy {
+					log.Printf("resolver: REDIRECT %s → exit %s (%s) via %s", q.Name, d.ExitName, d.Target, c.addr)
+					v.action, v.reason = "redirect", d.ExitName
+					return redirectReply(req, q, d.Target)
+				}
+				// The exit is down: resolve normally and say so in the log.
+				log.Printf("resolver: REDIRECT %s skipped, exit %s is down; forwarding", q.Name, d.ExitName)
+				fallback = "exit-down:" + d.ExitName
 			}
 		}
 	}
 
 	// Cache: serve the response if we still have it.
 	if msg := r.cache.Get(key, req.Id); msg != nil {
-		v.action, v.reason = "forward", "cache"
+		v.action, v.reason = "forward", forwardReason("cache")
 		return msg
 	}
 
@@ -186,7 +202,11 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 	})
 	up, _ := res.(*dns.Msg)
 	if up == nil {
-		v.action, v.reason = "error", "upstream"
+		v.action = "error"
+		v.reason = "upstream-failed"
+		if fallback != "" {
+			v.reason = fallback + "+upstream-failed"
+		}
 		return refusal(req, dns.RcodeServerFailure)
 	}
 
@@ -194,7 +214,7 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 	if ttl := minTTL(up); ttl > 0 {
 		r.cache.Put(key, up, ttl)
 	}
-	v.action, v.reason = "forward", "upstream"
+	v.action, v.reason = "forward", forwardReason("upstream")
 	out := up.Copy()
 	out.Id = req.Id
 	return out
@@ -427,6 +447,23 @@ func clientIP(clientAddr string) netip.Addr {
 	}
 	var zero netip.Addr
 	return zero
+}
+
+// redirectReply answers a REDIRECT with the exit's address. IPv4 gets an A
+// record pointing at the exit's gateway. Every other type gets an empty
+// NOERROR, so IPv6 cannot bypass the exit. The short TTL lets a changed exit
+// take effect quickly.
+func redirectReply(req *dns.Msg, q dns.Question, answerIP string) *dns.Msg {
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	ip := net.ParseIP(answerIP).To4()
+	if q.Qtype == dns.TypeA && ip != nil {
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+			A:   ip,
+		})
+	}
+	return resp
 }
 
 // rewriteReply answers a REWRITE decision directly, M1 semantics:

@@ -65,6 +65,28 @@ slowing answers. Rows are written in batches about once a second.
 
 Unknown-token refusals have no org, so they are stored but never shown to a tenant.
 
+## Exit nodes and redirects (M5, control path)
+
+An exit node is an egress point you run: a SOCKS5 proxy (probed with a real
+SOCKS5 handshake) or a WireGuard endpoint (not probed, reported `unknown`). A
+**redirect** rule sends matching names out through an exit:
+
+- The resolver answers a matching A query with the exit's `answer_ip`, with a
+  60 second TTL. That address must route to the exit on your network.
+- AAAA and other types get an empty answer, so IPv6 cannot bypass the exit.
+- A block always wins over a redirect.
+- A **down** exit is skipped. The query resolves normally and the log says
+  `forward` with reason `exit-down:<name>`.
+- Health is checked every 30 seconds and on demand (`POST /api/v1/exits/{id}/check`).
+  A state change reloads the resolver immediately.
+- Deleting an exit also deletes the redirect rules that pointed at it.
+
+**What is not built:** the traffic hop itself. Getting a redirected connection
+from `answer_ip` through the exit needs a route on your network (WireGuard
+peering, or a transparent proxy on the exit box), and the companion client
+(PLAN.md M5) is not started. Verify the hop on your own server before relying
+on it.
+
 ## Organizations (tenants)
 
 Every token belongs to one org and sees only that org's data. A cross-org

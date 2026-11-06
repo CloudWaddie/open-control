@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/cloudwaddie/opencontrol/internal/policy"
@@ -113,6 +114,8 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 		p.Block = policy.NewDomainSet()
 		p.Blocklists = policy.NewDomainSet()
 		p.Rewrites = map[string]policy.RewriteRecord{}
+		p.Redirect = policy.NewDomainSet()
+		p.RedirectTo = map[string]*policy.Exit{}
 		profs[p.ID] = &p
 	}
 	rows.Close()
@@ -165,6 +168,25 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 		}
 	}
 
+	// Exit nodes, by id. Health "down" marks an exit as unusable; anything else
+	// is usable (see exits.go).
+	exits := map[int64]*policy.Exit{}
+	rows, err = db.Query(`SELECT id, name, answer_ip, health FROM exit_nodes`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var e policy.Exit
+		var health string
+		if err := rows.Scan(&e.ID, &e.Name, &e.AnswerIP, &health); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		e.Healthy = health != "down"
+		exits[e.ID] = &e
+	}
+	rows.Close()
+
 	// Custom rules per profile.
 	rows, err = db.Query(`SELECT profile_id, kind, matcher, pattern, answer FROM profile_rules`)
 	if err != nil {
@@ -191,7 +213,11 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 		case "rewrite":
 			p.Rewrites[normDomain(pattern)] = policy.RewriteRecord{Target: answer}
 		case "redirect":
-			// Egress phase stub — accepted in schema, not compiled yet.
+			exitID, _ := strconv.ParseInt(answer, 10, 64)
+			if ex := exits[exitID]; ex != nil {
+				p.Redirect.Add(pattern, sub)
+				p.RedirectTo[ruleKey(matcher, pattern)] = ex
+			}
 		}
 	}
 	rows.Close()
@@ -244,6 +270,22 @@ func AddRule(db DBTX, org, profileID int64, kind, matcher, pattern, answer strin
 	}
 	if kind == "rewrite" && (matcher != "domain" || answer == "") {
 		return 0, fmt.Errorf("rewrite needs an exact domain and an answer (IP or name)")
+	}
+	if kind == "redirect" {
+		// For redirect rules, answer holds the exit node id. It must be one of
+		// org's exits, checked in the same statement as the profile check.
+		exitID, err := strconv.ParseInt(answer, 10, 64)
+		if err != nil || exitID <= 0 {
+			return 0, fmt.Errorf("redirect needs an exit node id")
+		}
+		res, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, pattern, answer)
+			SELECT ?, 'redirect', ?, ?, ? WHERE EXISTS (SELECT 1 FROM profiles WHERE id = ? AND org_id = ?)
+			AND EXISTS (SELECT 1 FROM exit_nodes WHERE id = ? AND org_id = ?)`,
+			profileID, matcher, pattern, answer, profileID, org, exitID, org)
+		if err != nil {
+			return 0, err
+		}
+		return insertedOrNotFound(res, "profile or exit node")
 	}
 	res, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, pattern, answer)
 		SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM profiles WHERE id = ? AND org_id = ?)`,

@@ -16,6 +16,7 @@ import (
 
 	"github.com/cloudwaddie/opencontrol/internal/config"
 	"github.com/cloudwaddie/opencontrol/internal/control"
+	"github.com/cloudwaddie/opencontrol/internal/egress"
 	"github.com/cloudwaddie/opencontrol/internal/qlog"
 	"github.com/cloudwaddie/opencontrol/internal/resolver"
 	"github.com/cloudwaddie/opencontrol/internal/store"
@@ -205,6 +206,7 @@ func runServe(cfgPath string) {
 	r := resolver.New(cfg)
 	r.SetRecorder(logger)
 	r.SetSnapshot(snap)
+
 	log.Printf("policy snapshot loaded (cached lists): %s", snap.Summary())
 
 	// reload recompiles rules + blocklists and swaps atomically; in-flight
@@ -218,6 +220,11 @@ func runServe(cfgPath string) {
 		r.SetSnapshot(s)
 		log.Printf("policy snapshot reloaded (fetch=%v): %s", fetch, s.Summary())
 	}
+
+	// Exit health: probe exits in the background. A state change reloads the
+	// snapshot so redirects stop (or resume) without a restart.
+	checker := &egress.Checker{DB: db, OnChange: func() { reload(false) }}
+	go checker.Run(bg)
 
 	// Triggers: first fetch right after boot, then hourly, plus SIGHUP for
 	// instant rule changes (e.g. `docker kill -s HUP`).
@@ -240,7 +247,7 @@ func runServe(cfgPath string) {
 	// Control plane. Writes reload the snapshot immediately.
 	api := &http.Server{
 		Addr:              cfg.APIListen,
-		Handler:           control.Handler(db, func() { reload(false) }),
+		Handler:           control.Handler(db, func() { reload(false) }, checker),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {

@@ -30,9 +30,12 @@ func (a Action) String() string {
 
 // Decision is the outcome of evaluating a query against a profile.
 type Decision struct {
-	Action Action
-	Reason string // machine-readable cause, e.g. "custom:block:tracker.example", "blocklist:ads.example"
-	Target string // rewrite/redirect target when Action == REWRITE
+	Action      Action
+	Reason      string // machine-readable cause, e.g. "custom:block:tracker.example", "blocklist:ads.example"
+	Target      string // rewrite target, or the exit node's answer IP for REDIRECT
+	ExitID      int64  // REDIRECT: the exit node chosen
+	ExitName    string // REDIRECT: its name, for logs
+	ExitHealthy bool   // REDIRECT: false means the resolver should fall back to forwarding
 }
 
 // Engine is the M0 stub: everything forwards, no lists loaded yet.

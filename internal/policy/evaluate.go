@@ -5,8 +5,9 @@ import "strings"
 // Evaluate applies PLAN.md §1's evaluation order for one query against a
 // profile:
 //
-//	rewrites → custom allow → blocklists + custom block → forward
+//	rewrites → custom allow → blocklists + custom block → redirect → forward
 //
+// Blocks always precede redirects, so a redirect can never un-block a name.
 // The resolver calls this exactly once per client query.
 func (s *Snapshot) Evaluate(p *Profile, qname string) Decision {
 	name := strings.ToLower(strings.TrimSuffix(qname, "."))
@@ -28,6 +29,21 @@ func (s *Snapshot) Evaluate(p *Profile, qname string) Decision {
 	}
 	if hit, key := p.Block.Match(name); hit {
 		return Decision{Action: ActionBlock, Reason: "custom:block:" + key}
+	}
+
+	// 5. Redirect rules: answer with the exit node's address. The resolver
+	// falls back to forwarding if that exit is down.
+	if hit, key := p.Redirect.Match(name); hit {
+		if ex := p.RedirectTo[key]; ex != nil {
+			return Decision{
+				Action:      ActionRedirect,
+				Reason:      "redirect:" + key,
+				Target:      ex.AnswerIP,
+				ExitID:      ex.ID,
+				ExitName:    ex.Name,
+				ExitHealthy: ex.Healthy,
+			}
+		}
 	}
 
 	// 6. Default: forward upstream.

@@ -54,6 +54,11 @@ func TestQueryLogsIsolationFiltersAndStats(t *testing.T) {
 		t.Fatalf("org A sees %d rows, want 4 (its own, including the old one)", len(got))
 	}
 	for _, l := range got {
+		if l.Org != orgA {
+			t.Errorf("row %d reports org %d, want %d", l.ID, l.Org, orgA)
+		}
+	}
+	for _, l := range got {
 		if l.QName == "tenant-b.example" || l.QName == "unattributed.example" {
 			t.Errorf("org A sees foreign row %q", l.QName)
 		}

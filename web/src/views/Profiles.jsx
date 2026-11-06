@@ -76,7 +76,8 @@ export default function Profiles({ me }) {
 
 function Rules({ profile, me, onError }) {
   const [rules, setRules] = useState(null);
-  const [form, setForm] = useState({ kind: 'block', matcher: 'domain', pattern: '', answer: '' });
+  const [exits, setExits] = useState([]);
+  const [form, setForm] = useState({ kind: 'block', matcher: 'domain', pattern: '', answer: '', exit_id: '' });
   const writable = can(me.role, 'operator');
 
   const load = () =>
@@ -86,12 +87,21 @@ function Rules({ profile, me, onError }) {
 
   useEffect(() => {
     load();
+    api('GET', '/exits')
+      .then((list) => {
+        setExits(list);
+        setForm((f) => ({ ...f, exit_id: f.exit_id || list[0]?.id || '' }));
+      })
+      .catch(() => {});
   }, [profile.id]);
+
+  const exitName = (id) => exits.find((x) => String(x.id) === String(id))?.name ?? `exit #${id}`;
 
   async function add(e) {
     e.preventDefault();
     try {
-      await api('POST', `/profiles/${profile.id}/rules`, form);
+      const body = { ...form, exit_id: Number(form.exit_id) };
+      await api('POST', `/profiles/${profile.id}/rules`, body);
       setForm({ ...form, pattern: '', answer: '' });
       load();
     } catch (err) {
@@ -132,7 +142,7 @@ function Rules({ profile, me, onError }) {
                 <td><span className={`pill ${r.kind}`}>{r.kind}</span></td>
                 <td>{r.matcher}</td>
                 <td><code>{r.pattern}</code></td>
-                <td>{r.answer}</td>
+                <td>{r.kind === 'redirect' ? `→ ${exitName(r.answer)}` : r.answer}</td>
                 <td>
                   {writable && (
                     <Confirm label="delete" onConfirm={() => remove(r.id)} />
@@ -160,6 +170,7 @@ function Rules({ profile, me, onError }) {
             <option value="block">block</option>
             <option value="allow">allow</option>
             <option value="rewrite">rewrite</option>
+            <option value="redirect">redirect via exit</option>
           </select>
           <select
             value={form.matcher}
@@ -181,6 +192,17 @@ function Rules({ profile, me, onError }) {
               value={form.answer}
               onChange={(e) => setForm({ ...form, answer: e.target.value })}
             />
+          )}
+          {form.kind === 'redirect' && (
+            exits.length === 0 ? (
+              <span className="muted">Add an exit first (Exits page).</span>
+            ) : (
+              <select value={form.exit_id} onChange={(e) => setForm({ ...form, exit_id: e.target.value })}>
+                {exits.map((x) => (
+                  <option key={x.id} value={x.id}>{x.name}</option>
+                ))}
+              </select>
+            )
           )}
           <button disabled={!form.pattern.trim()}>Add rule</button>
         </form>

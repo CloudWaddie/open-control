@@ -41,7 +41,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	f := &fixture{t: t, db: db, reloads: make(chan struct{}, 32)}
-	f.h = Handler(db, func() { f.reloads <- struct{}{} })
+	f.h = Handler(db, func() { f.reloads <- struct{}{} }, nil)
 	org, err := store.DefaultOrgID(db)
 	if err != nil {
 		t.Fatal(err)
@@ -388,6 +388,69 @@ func TestLogsAndStatsAreTenantScoped(t *testing.T) {
 	}
 	if code, _, _ := f.do("GET", "/api/v1/logs", "", ""); code != http.StatusUnauthorized {
 		t.Errorf("logs without token: %d, want 401", code)
+	}
+}
+
+// Exit nodes: tenant-scoped, usable in redirect rules only within their org,
+// and deleting one removes the rules that pointed at it.
+func TestExitsAreTenantScoped(t *testing.T) {
+	f := newFixture(t)
+	code, body, raw := f.do("POST", "/api/v1/exits", f.operator,
+		`{"name":"vps","kind":"socks5","address":"vps.example:1080","answer_ip":"10.77.0.1"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create exit: %d %s", code, raw)
+	}
+	exitID := body["id"].(float64)
+
+	// Visible to its own org, invisible to the other.
+	if _, _, raw := f.do("GET", "/api/v1/exits", f.viewer, ""); !strings.Contains(string(raw), "vps.example:1080") {
+		t.Errorf("own org cannot list its exit: %s", raw)
+	}
+	if _, _, raw := f.do("GET", "/api/v1/exits", f.otherAdmin, ""); strings.Contains(string(raw), "vps.example") {
+		t.Errorf("other tenant lists the exit: %s", raw)
+	}
+
+	// The other tenant cannot route its profile through this exit.
+	code, _, raw = f.do("POST", "/api/v1/profiles/1/rules", f.otherAdmin,
+		`{"kind":"redirect","matcher":"domain","pattern":"x.example","exit_id":`+itoa(int64(exitID))+`}`)
+	if code != http.StatusNotFound {
+		t.Errorf("cross-org redirect rule: %d %s, want 404", code, raw)
+	}
+
+	// Same org: a redirect rule works and is listed with its exit id.
+	if code, _, raw := f.do("POST", "/api/v1/profiles/1/rules", f.operator,
+		`{"kind":"redirect","matcher":"wildcard","pattern":"netflix.example","exit_id":`+itoa(int64(exitID))+`}`); code != http.StatusCreated {
+		t.Fatalf("own redirect rule: %d %s", code, raw)
+	}
+
+	// Deleting the exit removes its redirect rule and says how many.
+	code, body, raw = f.do("DELETE", "/api/v1/exits/"+itoa(int64(exitID)), f.operator, "")
+	if code != http.StatusOK || body["removed_rules"].(float64) != 1 {
+		t.Errorf("delete exit: %d %s, want 200 with removed_rules=1", code, raw)
+	}
+	if _, _, raw := f.do("GET", "/api/v1/profiles/1/rules", f.operator, ""); strings.Contains(string(raw), "netflix.example") {
+		t.Error("redirect rule survived its exit's deletion")
+	}
+}
+
+func TestExitValidationAndCheck(t *testing.T) {
+	f := newFixture(t)
+	if code, _, _ := f.do("POST", "/api/v1/exits", f.operator,
+		`{"name":"x","kind":"socks5","address":"no-port","answer_ip":"10.77.0.1"}`); code != http.StatusBadRequest {
+		t.Errorf("bad address: %d, want 400", code)
+	}
+	if code, _, _ := f.do("POST", "/api/v1/exits", f.viewer, `{}`); code != http.StatusForbidden {
+		t.Errorf("viewer creating exit: %d, want 403", code)
+	}
+	// Without a checker the on-demand check says so, rather than pretending.
+	code, body, _ := f.do("POST", "/api/v1/exits", f.operator,
+		`{"name":"vps","kind":"socks5","address":"vps.example:1080","answer_ip":"10.77.0.1"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("setup exit: %d", code)
+	}
+	id := itoa(int64(body["id"].(float64)))
+	if code, _, _ := f.do("POST", "/api/v1/exits/"+id+"/check", f.operator, ""); code != http.StatusNotImplemented {
+		t.Errorf("check with no checker: %d, want 501", code)
 	}
 }
 

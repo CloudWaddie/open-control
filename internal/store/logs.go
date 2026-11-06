@@ -69,7 +69,7 @@ func ListQueryLogs(db DBTX, org int64, f LogFilter) ([]QueryLog, error) {
 	if f.Limit <= 0 || f.Limit > 1000 {
 		f.Limit = 200
 	}
-	q := `SELECT id, COALESCE(endpoint_id, 0), ts, client_ip, qname, qtype, action, reason
+	q := `SELECT id, org_id, COALESCE(endpoint_id, 0), ts, client_ip, qname, qtype, action, reason
 		FROM query_logs WHERE org_id = ? AND id > ?`
 	args := []any{org, f.AfterID}
 	if f.Action != "" {
@@ -91,7 +91,7 @@ func ListQueryLogs(db DBTX, org int64, f LogFilter) ([]QueryLog, error) {
 	out := []QueryLog{}
 	for rows.Next() {
 		var l QueryLog
-		if err := rows.Scan(&l.ID, &l.Endpoint, &l.Ts, &l.Client, &l.QName, &l.QType, &l.Action, &l.Reason); err != nil {
+		if err := rows.Scan(&l.ID, &l.Org, &l.Endpoint, &l.Ts, &l.Client, &l.QName, &l.QType, &l.Action, &l.Reason); err != nil {
 			return nil, err
 		}
 		out = append(out, l)

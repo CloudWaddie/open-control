@@ -76,6 +76,13 @@ th { color: var(--muted); font-weight: 600; }
 .pill.block { background: #fde8e6; color: var(--danger); }
 .pill.allow { background: #e3f6ec; color: var(--ok); }
 .pill.rewrite { background: #e8eefc; color: var(--accent); }
+.pill.redirect { background: #f1e9ff; color: #6b3fc4; }
+.pill.forward { background: #eef0f5; color: var(--muted); }
+.pill.refused, .pill.error { background: #fdf0d5; color: #8a5a00; }
+.pill.health-healthy { background: #e3f6ec; color: var(--ok); }
+.pill.health-down { background: #fde8e6; color: var(--danger); }
+.pill.health-unknown { background: #eef0f5; color: var(--muted); }
+.notice-line { color: var(--ok); }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; }
 .stat .big { font-size: 1.8rem; font-weight: 600; margin-top: 0.25rem; }

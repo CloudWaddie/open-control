@@ -57,6 +57,9 @@ func (s *domainSet) Size() int { return len(s.m) }
 
 // Match reports whether qname is covered by the set, and which key matched.
 func (s *domainSet) Match(qname string) (bool, string) {
+	if s == nil {
+		return false, ""
+	}
 	d := strings.ToLower(strings.TrimSuffix(qname, "."))
 	if d == "" {
 		return false, ""

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, can, getToken, setToken } from './api.js';
 import Overview from './views/Overview.jsx';
+import Exits from './views/Exits.jsx';
 import Logs from './views/Logs.jsx';
 import Profiles from './views/Profiles.jsx';
 import Endpoints from './views/Endpoints.jsx';
@@ -16,6 +17,7 @@ const NAV = [
   { id: 'profiles', label: 'Profiles', min: 'viewer', view: Profiles },
   { id: 'endpoints', label: 'Endpoints', min: 'viewer', view: Endpoints },
   { id: 'blocklists', label: 'Blocklists', min: 'viewer', view: Blocklists },
+  { id: 'exits', label: 'Exits', min: 'viewer', view: Exits },
   { id: 'tokens', label: 'Tokens', min: 'admin', view: Tokens },
   { id: 'audit', label: 'Audit', min: 'admin', view: Audit },
 ];

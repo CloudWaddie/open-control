@@ -37,6 +37,17 @@ type Profile struct {
 	Block      *domainSet            // custom BLOCK rules
 	Blocklists *domainSet            // union of all org blocklist sources
 	Rewrites   map[string]RewriteRecord // exact-domain rewrites
+	Redirect   *domainSet            // redirect rules (keys index RedirectTo)
+	RedirectTo map[string]*Exit      // matched key → exit node
+}
+
+// Exit is an egress node a redirect rule can point at. Healthy is the state
+// last recorded by the health checker: false means "skip, forward instead".
+type Exit struct {
+	ID       int64
+	Name     string
+	AnswerIP string
+	Healthy  bool
 }
 
 type RewriteRecord struct {
