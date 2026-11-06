@@ -56,7 +56,7 @@ export default function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <strong>Open Control</strong>
+        <span className="brand"><span className="brand-mark" />Open Control</span>
         <nav>
           {visible.map((n) => (
             <a
@@ -111,6 +111,7 @@ function Login({ onSignedIn }) {
   return (
     <div className="center">
       <form className="card login" onSubmit={submit}>
+        <div className="brand-mark" aria-hidden="true" />
         <h1>Open Control</h1>
         <p className="muted">
           Paste an API token. Mint one with <code>opencontrol addtoken</code>.
