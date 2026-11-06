@@ -2,26 +2,48 @@
 
 Open-source, self-hosted alternative to Control D: DNS filtering, routing and
 analytics you run on your own infrastructure. See [PLAN.md](PLAN.md) for the
-architecture and roadmap. Current state: **M0 (walking skeleton)**.
+architecture and roadmap. Current state: **M1 (policy core)**.
 
 ## What works today
 
 - UDP53 + TCP53 listeners (miekg/dns), forwarding to public upstreams
 - Size-capped LRU cache with TTL floor/ceiling and concurrent-dedupe
+- Profiles and endpoints: an endpoint is selected by client source CIDR; the
+  most specific (longest-prefix) match wins; empty allowlists match nothing
+- Rules per profile: `block` / `allow` with `domain` (exact), `wildcard`
+  (domain + all subdomains) or `tld`; `rewrite` for exact domains
+- Blocklist subscriptions (hosts / adguard-style lines), cached on disk with ETag
+- Evaluation order: rewrite → allow → blocklists + custom block → forward
 - SQLite storage (modernc, pure Go) with embedded migrations
-- Single static binary; measured steady-state RSS ~16 MB on Windows dev box
+- Boots from cached blocklists (never waits on the network); fresh lists are
+  fetched in the background; SIGHUP reloads rules without restart
+
+## Admin CLI
+
+```sh
+opencontrol migrate
+opencontrol addprofile kids                       # prints profile id
+opencontrol addrule 1 block domain ads.example
+opencontrol addrule 1 block wildcard tracker.example
+opencontrol addrule 1 allow wildcard ok.tracker.example
+opencontrol addrule 1 block tld xyz
+opencontrol addrule 1 rewrite domain router.lan 10.0.0.1
+opencontrol addendpoint kids 2 10.9.0.0/16      # prints endpoint token
+opencontrol addlist https://example.org/hosts hosts
+opencontrol sync                                  # fetch blocklists now
+```
 
 ## Local development (no Docker)
 
 ```sh
-air                                    # hot-reload dev server (127.0.0.1:1053), config in .air.toml
-go run ./cmd/opencontrol serve         # plain run, no hot reload
-dig @127.0.0.1 -p 1053 example.com      # test query
-dig @127.0.0.1 -p 1053 example.com +tcp # TCP path
-go run ./cmd/opencontrol migrate        # apply schema migrations only
+air                                             # hot-reload dev server, 127.0.0.1:1053 (.air.toml)
+go run ./cmd/opencontrol serve                  # plain run, no hot reload
+dig @127.0.0.1 -p 1053 example.com
+dig @127.0.0.1 -p 1053 example.com +tcp
+go test ./...
 ```
 
-Config: `config.yaml` (see keys in `internal/config/config.go`) or env
+Config: `config.yaml` (see `internal/config/config.go`) or env
 `OC_LISTEN`, `OC_SQLITE_PATH`, `OC_DATA_DIR`.
 
 ## Deploy (Coolify / docker compose)
@@ -34,15 +56,22 @@ dig @<server-ip> example.com
 Ports 53 UDP+TCP are mapped natively — Coolify's HTTP proxy/TLS termination
 does not apply to DNS. Make sure no other service holds port 53 on the host.
 
+## Known gaps (M1)
+
+- Per-endpoint dedicated listen ports are not implemented (source-CIDR only)
+- Cache is shared across profiles; policy runs before the cache, so blocks are
+  per-profile, but upstream answers are not
+- SIGHUP reload is untested on Windows (Linux/Docker only)
+
 ## Repo layout
 
 ```
-cmd/opencontrol/   main binary (serve, migrate)
+cmd/opencontrol/   main binary (serve, migrate, admin commands)
 internal/config/   YAML + env config
 internal/resolver/ listeners, cache wiring, upstream pool, policy hook
-internal/policy/   rule engine (Action: FORWARD/BLOCK/REWRITE/redirect stub)
+internal/policy/   matcher, evaluation order, endpoint selection, blocklist parser
 internal/cache/    LRU + TTL clamp response cache
-internal/store/    SQLite + migrations
-Dockerfile         multi-stage → scratch (~15 MB image)
+internal/store/    SQLite + migrations, snapshot loader, admin queries
+Dockerfile         multi-stage → scratch
 docker-compose.yml Coolify-ready single service
 ```
