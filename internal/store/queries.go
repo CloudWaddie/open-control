@@ -59,7 +59,10 @@ func DefaultOrgID(db *sql.DB) (int64, error) {
 // policy.Snapshot: endpoints, profiles, custom rules and blocklist sources.
 // Blocklist contents are read through the ETag file cache; a DB row marks the
 // last successful fetch.
-func LoadSnapshot(db *sql.DB, dataDir string) (*policy.Snapshot, error) {
+//
+// fetch=false reads blocklists from the on-disk cache only (no network), so
+// startup never waits on a remote host. fetch=true refreshes them first.
+func LoadSnapshot(db *sql.DB, dataDir string, fetch bool) (*policy.Snapshot, error) {
 	blDir := dataDir + "/blocklists"
 
 	// Profiles
@@ -84,34 +87,52 @@ func LoadSnapshot(db *sql.DB, dataDir string) (*policy.Snapshot, error) {
 
 	// Blocklist sources, per org: fetch (cache-aware) and union into that
 	// org's compiled domain set.
-	rows, err = db.Query(`SELECT id, org_id, url, format FROM blocklist_sources`)
+	// Read every source and CLOSE the cursor before doing anything else: the DB
+	// pool has one connection, so writing while a cursor is open deadlocks.
+	type source struct {
+		id, orgID int64
+		url       string
+	}
+	var sources []source
+	rows, err = db.Query(`SELECT id, org_id, url FROM blocklist_sources`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var id, orgID int64
-		var url, format string
-		if err := rows.Scan(&id, &orgID, &url, &format); err != nil {
+		var s source
+		if err := rows.Scan(&s.id, &s.orgID, &s.url); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		domains, err := policy.FetchBlocklist(url, blDir)
+		sources = append(sources, s)
+	}
+	rows.Close()
+
+	for _, s := range sources {
+		var domains []string
+		var err error
+		if fetch {
+			domains, err = policy.FetchBlocklist(s.url, blDir)
+			if err == nil {
+				if _, uerr := db.Exec(`UPDATE blocklist_sources SET last_synced = datetime('now') WHERE id = ?`, s.id); uerr != nil {
+					log.Printf("policy: record sync time for %s: %v", s.url, uerr)
+				}
+			}
+		} else {
+			domains, err = policy.CachedBlocklist(s.url, blDir)
+		}
 		if err != nil {
-			log.Printf("policy: blocklist %s: %v (skipped)", url, err)
+			log.Printf("policy: blocklist %s: %v (skipped)", s.url, err)
 			continue
 		}
 		for _, p := range profs {
-			if p.OrgID == orgID {
+			if p.OrgID == s.orgID {
 				for _, d := range domains {
 					p.Blocklists.Add(d, true) // lists block subdomains implicitly
 				}
 			}
 		}
-		if _, err := db.Exec(`UPDATE blocklist_sources SET last_synced = datetime('now'), etag = substr(hex(randomblob(8)), 1, 16) WHERE id = ?`, id); err != nil {
-			return nil, err
-		}
 	}
-	rows.Close()
 
 	// Custom rules per profile.
 	rows, err = db.Query(`SELECT profile_id, kind, matcher, pattern, answer FROM profile_rules`)

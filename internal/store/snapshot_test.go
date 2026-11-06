@@ -35,7 +35,7 @@ func TestSnapshotDecisions(t *testing.T) {
 		}
 	}
 
-	snap, err := LoadSnapshot(db, t.TempDir())
+	snap, err := LoadSnapshot(db, t.TempDir(), false) // no network in tests
 	if err != nil {
 		t.Fatal(err)
 	}

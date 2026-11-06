@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/cloudwaddie/opencontrol/internal/config"
@@ -123,28 +125,44 @@ func openDB(cfgPath string) (*config.Config, *sql.DB) {	cfg := loadConfig(cfgPat
 func runServe(cfgPath string) {
 	cfg, db := openDB(cfgPath)
 
-	snap, err := store.LoadSnapshot(db, cfg.DataDir)
+	// Boot from cached blocklists only: the resolver must start serving even if
+	// a list host is slow or down. Fresh lists are fetched in the background.
+	snap, err := store.LoadSnapshot(db, cfg.DataDir, false)
 	if err != nil {
 		log.Fatalf("policy snapshot: %v", err)
 	}
 
 	r := resolver.New(cfg)
 	r.SetSnapshot(snap)
-	log.Printf("policy snapshot loaded: %s", snap.Summary())
+	log.Printf("policy snapshot loaded (cached lists): %s", snap.Summary())
 
-	// Periodic recompile: picks up new rules and refreshed blocklists without
-	// downtime (atomic swap; in-flight queries keep the previous snapshot).
+	// reload recompiles rules + blocklists and swaps atomically; in-flight
+	// queries keep the previous snapshot, so nothing is dropped.
+	reload := func(fetch bool) {
+		s, err := store.LoadSnapshot(db, cfg.DataDir, fetch)
+		if err != nil {
+			log.Printf("policy snapshot reload failed: %v", err)
+			return
+		}
+		r.SetSnapshot(s)
+		log.Printf("policy snapshot reloaded (fetch=%v): %s", fetch, s.Summary())
+	}
+
+	// Triggers: first fetch right after boot, then hourly, plus SIGHUP for
+	// instant rule changes (e.g. `docker kill -s HUP`).
 	go func() {
+		reload(true)
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
 		for range t.C {
-			snap, err := store.LoadSnapshot(db, cfg.DataDir)
-			if err != nil {
-				log.Printf("policy snapshot refresh failed: %v", err)
-				continue
-			}
-			r.SetSnapshot(snap)
-			log.Printf("policy snapshot reloaded: %s", snap.Summary())
+			reload(true)
+		}
+	}()
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			reload(false) // rules only; lists refresh on the hourly fetch
 		}
 	}()
 
@@ -169,7 +187,7 @@ func runMigrate(cfgPath string) {
 func runSync(cfgPath string) {
 	cfg, db := openDB(cfgPath)
 	defer db.Close()
-	snap, err := store.LoadSnapshot(db, cfg.DataDir)
+	snap, err := store.LoadSnapshot(db, cfg.DataDir, true)
 	if err != nil {
 		log.Fatalf("sync: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -92,12 +93,25 @@ func parseDomains(text string) []string {
 		if !strings.Contains(d, ".") {
 			continue // ignore "localhost" etc. — nothing resolvable to block precisely
 		}
+		if _, err := netip.ParseAddr(d); err == nil {
+			continue // a bare IP (e.g. the sink "0.0.0.0" in hosts files) is not a domain
+		}
 		if strings.HasPrefix(d, "*") || strings.HasPrefix(d, "@@") {
 			continue
 		}
 		out = append(out, d)
 	}
 	return out
+}
+
+// CachedBlocklist returns the domains from the last successful fetch of url,
+// without touching the network. Errors if the list was never fetched.
+func CachedBlocklist(url, dir string) ([]string, error) {
+	path, err := cachePathFor(url, dir)
+	if err != nil {
+		return nil, err
+	}
+	return parseFile(path)
 }
 
 func parseFile(path string) ([]string, error) {
