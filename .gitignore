@@ -17,3 +17,6 @@ build-errors.log
 .idea/
 .vscode/
 nul
+
+# Frontend
+web/node_modules/

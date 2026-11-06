@@ -185,6 +185,25 @@ func TestEndpointCreateReturnsToken(t *testing.T) {
 	}
 }
 
+func TestWhoami(t *testing.T) {
+	f := newFixture(t)
+	code, body, _ := f.do("GET", "/api/v1/whoami", f.operator, "")
+	if code != 200 || body["name"] != "ops" || body["role"] != "operator" {
+		t.Fatalf("whoami: %d %v", code, body)
+	}
+	if code, _, _ := f.do("GET", "/api/v1/whoami", "", ""); code != 401 {
+		t.Errorf("whoami without token: %d, want 401", code)
+	}
+}
+
+func TestUIServedFromSameMux(t *testing.T) {
+	f := newFixture(t)
+	code, _, raw := f.do("GET", "/audit", "", "")
+	if code != 200 || !strings.Contains(string(raw), `id="root"`) {
+		t.Errorf("UI route: %d", code)
+	}
+}
+
 func TestMintedTokenWorks(t *testing.T) {
 	f := newFixture(t)
 	code, body, raw := f.do("POST", "/api/v1/tokens", f.admin, `{"name":"ci","role":"viewer"}`)

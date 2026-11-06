@@ -20,6 +20,7 @@ import (
 	"strings"
 
 	"github.com/cloudwaddie/opencontrol/internal/store"
+	"github.com/cloudwaddie/opencontrol/internal/web"
 )
 
 type principal struct {
@@ -47,6 +48,8 @@ func Handler(db *sql.DB, reload func()) http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
+	mux.Handle("GET /api/v1/whoami", s.require("viewer", s.whoami))
+
 	mux.Handle("GET /api/v1/profiles", s.require("viewer", s.listProfiles))
 	mux.Handle("POST /api/v1/profiles", s.require("operator", s.createProfile))
 	mux.Handle("GET /api/v1/profiles/{id}/rules", s.require("viewer", s.listRules))
@@ -64,7 +67,16 @@ func Handler(db *sql.DB, reload func()) http.Handler {
 	mux.Handle("GET /api/v1/audit", s.require("admin", s.listAudit))
 	mux.Handle("POST /api/v1/tokens", s.require("admin", s.createToken))
 
+	// Everything else is the web UI (see internal/web).
+	mux.Handle("/", web.Handler())
+
 	return mux
+}
+
+// whoami lets the UI learn who and what role the presented token has.
+func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
+	p, _ := r.Context().Value(ctxKey{}).(principal)
+	writeJSON(w, http.StatusOK, map[string]string{"name": p.name, "role": p.role})
 }
 
 // require authenticates the bearer token and enforces a minimum role.
