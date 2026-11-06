@@ -30,7 +30,9 @@ Usage:
                                         matchers:   domain|wildcard|tld
                                         rewrite:    domain + ANSWER (IP or name)
   opencontrol addlist URL [FORMAT]      subscribe to a blocklist (hosts|dnsmasq|adguard)
-  opencontrol addtoken NAME ROLE        mint an API token (admin|operator|viewer), printed once
+  opencontrol addorg NAME               create an org (tenant), prints its id
+  opencontrol addtoken NAME ROLE [ORG]  mint an API token (admin|operator|viewer) for ORG
+                                        (default: the default org), printed once
   opencontrol addprofile NAME           create a profile, prints its id
   opencontrol addendpoint NAME PROFILE_ID CIDR[,CIDR...]
                                         create an endpoint; clients in CIDRs get PROFILE
@@ -69,7 +71,7 @@ func main() {
 		}
 		_, db := openDB(*cfgPath)
 		defer db.Close()
-		id, err := store.AddProfile(db, flag.Arg(1))
+		id, err := store.AddProfile(db, defaultOrg(db), flag.Arg(1))
 		if err != nil {
 			log.Fatalf("addprofile: %v", err)
 		}
@@ -85,7 +87,7 @@ func main() {
 		}
 		_, db := openDB(*cfgPath)
 		defer db.Close()
-		id, token, err := store.AddEndpoint(db, flag.Arg(1), profileID, flag.Arg(3))
+		id, token, err := store.AddEndpoint(db, defaultOrg(db), flag.Arg(1), profileID, flag.Arg(3))
 		if err != nil {
 			log.Fatalf("addendpoint: %v", err)
 		}
@@ -98,12 +100,34 @@ func main() {
 		}
 		_, db := openDB(*cfgPath)
 		defer db.Close()
-		tok, err := store.CreateToken(db, flag.Arg(1), flag.Arg(2))
+		org := defaultOrg(db)
+		orgName := "default"
+		if flag.NArg() > 3 {
+			orgName = flag.Arg(3)
+			id, err := store.OrgIDByName(db, orgName)
+			if err != nil {
+				log.Fatalf("addtoken: %v", err)
+			}
+			org = id
+		}
+		tok, err := store.CreateToken(db, org, flag.Arg(1), flag.Arg(2))
 		if err != nil {
 			log.Fatalf("addtoken: %v", err)
 		}
-		log.Printf("addtoken: %s (%s) — copy it now, it is not shown again", flag.Arg(1), flag.Arg(2))
+		log.Printf("addtoken: %s (%s) for org %s — copy it now, it is not shown again", flag.Arg(1), flag.Arg(2), orgName)
 		fmt.Println(tok)
+	case "addorg":
+		if flag.NArg() < 2 {
+			fmt.Fprint(os.Stderr, "usage: opencontrol addorg NAME\n")
+			os.Exit(2)
+		}
+		_, db := openDB(*cfgPath)
+		defer db.Close()
+		id, err := store.CreateOrg(db, flag.Arg(1))
+		if err != nil {
+			log.Fatalf("addorg: %v", err)
+		}
+		fmt.Println(id)
 	case "addlist":
 		if flag.NArg() < 2 {
 			fmt.Fprint(os.Stderr, "usage: opencontrol addlist URL [FORMAT]\n")
@@ -122,6 +146,15 @@ func loadConfig(path string) *config.Config {
 		log.Fatalf("config: %v", err)
 	}
 	return cfg
+}
+
+// defaultOrg is the org the CLI manages. Use the API with an org's token for others.
+func defaultOrg(db *sql.DB) int64 {
+	id, err := store.DefaultOrgID(db)
+	if err != nil {
+		log.Fatalf("no org: %v", err)
+	}
+	return id
 }
 
 func openDB(cfgPath string) (*config.Config, *sql.DB) {	cfg := loadConfig(cfgPath)
@@ -237,7 +270,7 @@ func runAddRule(cfgPath string, args []string) {
 	if len(args) > 4 {
 		answer = args[4] // rewrite answer; ignored by other kinds
 	}
-	if _, err := store.AddRule(db, profileID, kind, matcher, pattern, answer); err != nil {
+	if _, err := store.AddRule(db, defaultOrg(db), profileID, kind, matcher, pattern, answer); err != nil {
 		log.Fatalf("addrule: %v", err)
 	}
 	log.Printf("addrule: %s %s %s → profile %d (applies on next snapshot reload; restart serve to apply now)", kind, matcher, pattern, profileID)
@@ -252,7 +285,7 @@ func runAddList(cfgPath string, args []string) {
 	if len(args) > 1 {
 		format = args[1]
 	}
-	if err := store.AddBlocklistSource(db, url, format); err != nil {
+	if err := store.AddBlocklistSource(db, defaultOrg(db), url, format); err != nil {
 		log.Fatalf("addlist: %v", err)
 	}
 	log.Printf("addlist: %s (%s) subscribed — run 'opencontrol sync' to fetch now", url, format)

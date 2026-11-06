@@ -2,8 +2,10 @@ package store
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -11,11 +13,14 @@ import (
 	"github.com/cloudwaddie/opencontrol/internal/policy"
 )
 
-// queries.go — data access used by the resolver snapshot loader and the admin
-// CLI. The control-plane API (M2) will re-use these through its own layer.
+// queries.go — org-scoped writes and the resolver snapshot loader.
+//
+// Every write takes the org explicitly and checks ownership in the same SQL
+// statement (INSERT … SELECT … WHERE EXISTS, or DELETE … WHERE org matches), so
+// one org can never reference or change another org's rows.
 
-// SeedDefaults creates org/profile/endpoint rows on first run so the resolver
-// has something to enforce immediately.
+// SeedDefaults creates the first org with a default profile and endpoint so
+// the resolver has something to enforce on first run.
 func SeedDefaults(db DBTX) error {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM orgs`).Scan(&n); err != nil {
@@ -24,13 +29,12 @@ func SeedDefaults(db DBTX) error {
 	if n > 0 {
 		return nil
 	}
-	res, err := db.Exec(`INSERT INTO orgs (name) VALUES ('default')`)
+	orgID, err := CreateOrg(db, "default")
 	if err != nil {
 		return err
 	}
-	orgID, _ := res.LastInsertId()
 
-	res, err = db.Exec(`INSERT INTO profiles (org_id, name, options) VALUES (?, 'default', '{}')`, orgID)
+	res, err := db.Exec(`INSERT INTO profiles (org_id, name, options) VALUES (?, 'default', '{}')`, orgID)
 	if err != nil {
 		return err
 	}
@@ -45,7 +49,30 @@ func SeedDefaults(db DBTX) error {
 	return nil
 }
 
-// DefaultOrgID returns the seeded org (first row).
+// CreateOrg adds a tenant and returns its id.
+func CreateOrg(db DBTX, name string) (int64, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, fmt.Errorf("org name is required")
+	}
+	res, err := db.Exec(`INSERT INTO orgs (name) VALUES (?)`, name)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// OrgIDByName resolves an org name to its id.
+func OrgIDByName(db DBTX, name string) (int64, error) {
+	var id int64
+	err := db.QueryRow(`SELECT id FROM orgs WHERE name = ?`, name).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("org %q: %w", name, ErrNotFound)
+	}
+	return id, err
+}
+
+// DefaultOrgID returns the first org (the seeded one). The CLI operates on it.
 func DefaultOrgID(db DBTX) (int64, error) {
 	var id int64
 	if err := db.QueryRow(`SELECT id FROM orgs ORDER BY id LIMIT 1`).Scan(&id); err != nil {
@@ -84,8 +111,6 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 	}
 	rows.Close()
 
-	// Blocklist sources, per org: fetch (cache-aware) and union into that
-	// org's compiled domain set.
 	// Read every source and CLOSE the cursor before doing anything else: the DB
 	// pool has one connection, so writing while a cursor is open deadlocks.
 	type source struct {
@@ -107,6 +132,7 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 	}
 	rows.Close()
 
+	// Each org's lists go only into that org's profiles.
 	for _, s := range sources {
 		var domains []string
 		var err error
@@ -191,9 +217,9 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 	return policy.NewSnapshot(eps, profs), nil
 }
 
-// AddRule inserts a custom rule row (admin CLI for M1; M2 gets the API+UI).
-// pattern is the domain (or ".tld"); answer is only used by rewrite rules.
-func AddRule(db DBTX, profileID int64, kind, matcher, pattern, answer string) (int64, error) {
+// AddRule inserts a rule into one of org's profiles. pattern is the domain (or
+// ".tld"); answer is only used by rewrite rules.
+func AddRule(db DBTX, org, profileID int64, kind, matcher, pattern, answer string) (int64, error) {
 	switch kind {
 	case "block", "allow", "rewrite", "redirect":
 	default:
@@ -213,35 +239,32 @@ func AddRule(db DBTX, profileID int64, kind, matcher, pattern, answer string) (i
 	if kind == "rewrite" && (matcher != "domain" || answer == "") {
 		return 0, fmt.Errorf("rewrite needs an exact domain and an answer (IP or name)")
 	}
-	res, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, pattern, answer) VALUES (?, ?, ?, ?, ?)`,
-		profileID, kind, matcher, pattern, answer)
+	res, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, pattern, answer)
+		SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM profiles WHERE id = ? AND org_id = ?)`,
+		profileID, kind, matcher, pattern, answer, profileID, org)
+	if err != nil {
+		return 0, err
+	}
+	return insertedOrNotFound(res, "profile")
+}
+
+// AddProfile creates a profile in org and returns its id.
+func AddProfile(db DBTX, org int64, name string) (int64, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, fmt.Errorf("profile name is required")
+	}
+	res, err := db.Exec(`INSERT INTO profiles (org_id, name) VALUES (?, ?)`, org, name)
 	if err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()
 }
 
-// AddProfile creates a profile on the default org and returns its id.
-func AddProfile(db DBTX, name string) (int64, error) {
-	orgID, err := DefaultOrgID(db)
-	if err != nil {
-		return 0, fmt.Errorf("no org: %w", err)
-	}
-	res, err := db.Exec(`INSERT INTO profiles (org_id, name) VALUES (?, ?)`, orgID, name)
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
-
-// AddEndpoint creates an endpoint bound to profileID, admitting clients whose
-// source address falls in cidrs (comma-separated IPs or prefixes). Returns the
-// endpoint's id and its generated token.
-func AddEndpoint(db DBTX, name string, profileID int64, cidrs string) (int64, string, error) {
-	orgID, err := DefaultOrgID(db)
-	if err != nil {
-		return 0, "", fmt.Errorf("no org: %w", err)
-	}
+// AddEndpoint creates an endpoint in org bound to one of org's profiles,
+// admitting clients whose source address falls in cidrs (comma-separated IPs
+// or prefixes). Returns the endpoint's id and its generated token.
+func AddEndpoint(db DBTX, org int64, name string, profileID int64, cidrs string) (int64, string, error) {
 	var list []string
 	for _, c := range strings.Split(cidrs, ",") {
 		if c = strings.TrimSpace(c); c != "" {
@@ -263,28 +286,44 @@ func AddEndpoint(db DBTX, name string, profileID int64, cidrs string) (int64, st
 		return 0, "", err
 	}
 	token := hex.EncodeToString(buf)
-	res, err := db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, name, allowed_source_ips) VALUES (?, ?, ?, ?, ?)`,
-		orgID, profileID, token, name, string(raw))
+	res, err := db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, name, allowed_source_ips)
+		SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM profiles WHERE id = ? AND org_id = ?)`,
+		org, profileID, token, name, string(raw), profileID, org)
 	if err != nil {
 		return 0, "", err
 	}
-	id, _ := res.LastInsertId()
+	id, err := insertedOrNotFound(res, "profile")
+	if err != nil {
+		return 0, "", err
+	}
 	return id, token, nil
 }
 
-// AddBlocklistSource registers a blocklist subscription on the default org.
-func AddBlocklistSource(db DBTX, url, format string) error {
-	orgID, err := DefaultOrgID(db)
-	if err != nil {
-		return fmt.Errorf("no org: %w", err)
-	}
+// AddBlocklistSource subscribes org to a list. Re-subscribing is a no-op.
+func AddBlocklistSource(db DBTX, org int64, url, format string) error {
 	switch format {
 	case "hosts", "dnsmasq", "adguard":
 	default:
 		return fmt.Errorf("unknown format %q (hosts|dnsmasq|adguard)", format)
 	}
-	_, err = db.Exec(`INSERT OR IGNORE INTO blocklist_sources (org_id, url, format) VALUES (?, ?, ?)`, orgID, url, format)
+	_, err := db.Exec(`INSERT OR IGNORE INTO blocklist_sources (org_id, url, format) VALUES (?, ?, ?)`, org, url, format)
 	return err
+}
+
+// insertedOrNotFound maps a zero-row INSERT…SELECT (the ownership check failed)
+// to ErrNotFound, and otherwise returns the new row id.
+func insertedOrNotFound(res interface {
+	RowsAffected() (int64, error)
+	LastInsertId() (int64, error)
+}, what string) (int64, error) {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("%s not found in this org: %w", what, ErrNotFound)
+	}
+	return res.LastInsertId()
 }
 
 func normDomain(d string) string {

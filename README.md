@@ -2,7 +2,8 @@
 
 Open-source, self-hosted alternative to Control D: DNS filtering, routing and
 analytics you run on your own infrastructure. See [PLAN.md](PLAN.md) for the
-architecture and roadmap. Current state: **M1 (policy core)**.
+architecture and roadmap. Current state: **M2 (control plane: API, web UI, orgs)**
+— user accounts and OIDC are still to come.
 
 ## What works today
 
@@ -33,10 +34,34 @@ opencontrol addlist https://example.org/hosts hosts
 opencontrol sync                                  # fetch blocklists now
 ```
 
+## Web UI
+
+The control plane serves a React SPA from the same port as the API
+(`http://127.0.0.1:8080/` by default). Sign in with an API token. The UI is
+compiled into the binary (`internal/web/dist`, committed), so `go build` needs no
+Node. To change the UI: `cd web && npm install && npm run build`.
+
+Pages: profiles and rules, endpoints (shows the token once), blocklists, tokens
+(admin: mint and revoke), audit log (admin).
+
+## Organizations (tenants)
+
+Every token belongs to one org and sees only that org's data. A cross-org
+reference (binding an endpoint to another org's profile, or deleting another
+org's rule) is answered `404`, the same as a missing row.
+
+```sh
+opencontrol addorg acme                          # prints the org id
+opencontrol addtoken acme-admin admin acme       # token for that org, shown once
+```
+
+The CLI commands (`addprofile`, `addrule`, `addendpoint`, `addlist`) operate on
+the default org. Other orgs are managed through the API with their own token.
+
 ## Control API (M2, partial)
 
 Listens on `OC_API_LISTEN` (default `127.0.0.1:8080`). Authenticate with a
-bearer token minted by `opencontrol addtoken NAME admin|operator|viewer`.
+bearer token minted by `opencontrol addtoken NAME admin|operator|viewer [ORG]`.
 
 | Role     | Can                                                        |
 |----------|------------------------------------------------------------|
@@ -51,11 +76,12 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/jso
      http://127.0.0.1:8080/api/v1/profiles/1/rules
 ```
 
-Every write is audited (`GET /api/v1/audit`, admin) and reloads the resolver
-immediately. Tokens are stored as SHA-256 hashes and shown once at creation.
+Every write runs in one transaction with its audit row (`GET /api/v1/audit`,
+admin), then reloads the resolver. Tokens are stored as SHA-256 hashes and shown
+once at creation. Admins can list and revoke their org's tokens
+(`GET`/`DELETE /api/v1/tokens`); an admin cannot revoke the token they are using.
 
-Not yet: multiple orgs (everything is scoped to the default org), user accounts
-and OIDC, the web UI, and an atomic write+audit transaction.
+Not yet: user accounts and OIDC (only API tokens exist), and an OpenAPI spec.
 
 ## Local development (no Docker)
 

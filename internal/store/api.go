@@ -11,8 +11,20 @@ import (
 	"time"
 )
 
-// api.go — data access for the control-plane REST API (PLAN.md M2).
-// Everything is scoped to the default org for now; multi-org scoping is M2b.
+// api.go — org-scoped data access for the control-plane REST API (PLAN.md M2).
+// Every read filters by org; every delete matches org in the WHERE clause, so
+// a row from another org is indistinguishable from a missing one (404).
+
+// DBTX is satisfied by *sql.DB and *sql.Tx. Mutations take a DBTX so a change
+// and its audit row can commit or roll back together.
+type DBTX interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// ErrNotFound is returned when a row is missing or belongs to another org.
+var ErrNotFound = errors.New("not found")
 
 type Profile struct {
 	ID   int64  `json:"id"`
@@ -50,49 +62,18 @@ type AuditEntry struct {
 	Target string `json:"target"`
 }
 
-// ErrNotFound is returned when a delete targets a missing row.
-var ErrNotFound = errors.New("not found")
-
-// DBTX is satisfied by *sql.DB and *sql.Tx. Mutations take a DBTX so a change
-// and its audit row can commit or roll back together.
-type DBTX interface {
-	Exec(query string, args ...any) (sql.Result, error)
-	Query(query string, args ...any) (*sql.Rows, error)
-	QueryRow(query string, args ...any) *sql.Row
-}
-
+// Token is an API credential. OrgID scopes everything it can reach; the hash
+// is never serialized.
 type Token struct {
 	ID        int64  `json:"id"`
+	OrgID     int64  `json:"-"`
 	Name      string `json:"name"`
 	Role      string `json:"role"`
 	CreatedAt string `json:"created_at"`
 }
 
-// ListTokens returns token metadata. Hashes are never returned.
-func ListTokens(db DBTX) ([]Token, error) {
-	rows, err := db.Query(`SELECT id, name, role, created_at FROM api_tokens ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []Token{}
-	for rows.Next() {
-		var t Token
-		if err := rows.Scan(&t.ID, &t.Name, &t.Role, &t.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, t)
-	}
-	return out, rows.Err()
-}
-
-// RevokeToken deletes a token; its bearer is refused from the next request on.
-func RevokeToken(db DBTX, id int64) error {
-	return deleteRow(db, `DELETE FROM api_tokens WHERE id = ?`, id)
-}
-
-func ListProfiles(db DBTX) ([]Profile, error) {
-	rows, err := db.Query(`SELECT id, name FROM profiles ORDER BY id`)
+func ListProfiles(db DBTX, org int64) ([]Profile, error) {
+	rows, err := db.Query(`SELECT id, name FROM profiles WHERE org_id = ? ORDER BY id`, org)
 	if err != nil {
 		return nil, err
 	}
@@ -108,8 +89,11 @@ func ListProfiles(db DBTX) ([]Profile, error) {
 	return out, rows.Err()
 }
 
-func ListRules(db DBTX, profileID int64) ([]Rule, error) {
-	rows, err := db.Query(`SELECT id, profile_id, kind, matcher, pattern, answer FROM profile_rules WHERE profile_id = ? ORDER BY id`, profileID)
+// ListRules returns rules of one profile, but only if the profile is in org.
+func ListRules(db DBTX, org, profileID int64) ([]Rule, error) {
+	rows, err := db.Query(`SELECT r.id, r.profile_id, r.kind, r.matcher, r.pattern, r.answer
+		FROM profile_rules r JOIN profiles p ON p.id = r.profile_id
+		WHERE r.profile_id = ? AND p.org_id = ? ORDER BY r.id`, profileID, org)
 	if err != nil {
 		return nil, err
 	}
@@ -125,12 +109,13 @@ func ListRules(db DBTX, profileID int64) ([]Rule, error) {
 	return out, rows.Err()
 }
 
-func DeleteRule(db DBTX, id int64) error {
-	return deleteRow(db, `DELETE FROM profile_rules WHERE id = ?`, id)
+func DeleteRule(db DBTX, org, id int64) error {
+	return deleteRow(db, `DELETE FROM profile_rules WHERE id = ?
+		AND profile_id IN (SELECT id FROM profiles WHERE org_id = ?)`, id, org)
 }
 
-func ListEndpoints(db DBTX) ([]Endpoint, error) {
-	rows, err := db.Query(`SELECT id, profile_id, name, allowed_source_ips FROM endpoints ORDER BY id`)
+func ListEndpoints(db DBTX, org int64) ([]Endpoint, error) {
+	rows, err := db.Query(`SELECT id, profile_id, name, allowed_source_ips FROM endpoints WHERE org_id = ? ORDER BY id`, org)
 	if err != nil {
 		return nil, err
 	}
@@ -142,18 +127,18 @@ func ListEndpoints(db DBTX) ([]Endpoint, error) {
 		if err := rows.Scan(&e.ID, &e.ProfileID, &e.Name, &raw); err != nil {
 			return nil, err
 		}
-		e.CIDRs = parseCIDRList(raw)
+		_ = json.Unmarshal([]byte(raw), &e.CIDRs)
 		out = append(out, e)
 	}
 	return out, rows.Err()
 }
 
-func DeleteEndpoint(db DBTX, id int64) error {
-	return deleteRow(db, `DELETE FROM endpoints WHERE id = ?`, id)
+func DeleteEndpoint(db DBTX, org, id int64) error {
+	return deleteRow(db, `DELETE FROM endpoints WHERE id = ? AND org_id = ?`, id, org)
 }
 
-func ListBlocklists(db DBTX) ([]Blocklist, error) {
-	rows, err := db.Query(`SELECT id, url, format, COALESCE(last_synced, '') FROM blocklist_sources ORDER BY id`)
+func ListBlocklists(db DBTX, org int64) ([]Blocklist, error) {
+	rows, err := db.Query(`SELECT id, url, format, COALESCE(last_synced, '') FROM blocklist_sources WHERE org_id = ? ORDER BY id`, org)
 	if err != nil {
 		return nil, err
 	}
@@ -169,16 +154,17 @@ func ListBlocklists(db DBTX) ([]Blocklist, error) {
 	return out, rows.Err()
 }
 
-func DeleteBlocklist(db DBTX, id int64) error {
-	return deleteRow(db, `DELETE FROM blocklist_sources WHERE id = ?`, id)
+func DeleteBlocklist(db DBTX, org, id int64) error {
+	return deleteRow(db, `DELETE FROM blocklist_sources WHERE id = ? AND org_id = ?`, id, org)
 }
 
-// ListAudit returns the newest audit entries first.
-func ListAudit(db DBTX, limit int) ([]AuditEntry, error) {
+// ListAudit returns the org's newest audit entries first.
+func ListAudit(db DBTX, org int64, limit int) ([]AuditEntry, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := db.Query(`SELECT id, ts, actor, action, target FROM audit_logs ORDER BY id DESC LIMIT ?`, limit)
+	rows, err := db.Query(`SELECT id, ts, actor, action, target FROM audit_logs
+		WHERE org_id = ? ORDER BY id DESC LIMIT ?`, org, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -194,14 +180,10 @@ func ListAudit(db DBTX, limit int) ([]AuditEntry, error) {
 	return out, rows.Err()
 }
 
-// InsertAudit records an admin action. Every mutating API call writes one.
-func InsertAudit(db DBTX, actor, action, target string) error {
-	orgID, err := DefaultOrgID(db)
-	if err != nil {
-		return err
-	}
-	_, err = db.Exec(`INSERT INTO audit_logs (org_id, ts, actor, action, target) VALUES (?, ?, ?, ?, ?)`,
-		orgID, time.Now().Unix(), actor, action, target)
+// InsertAudit records an action for org. Every mutating API call writes one.
+func InsertAudit(db DBTX, org int64, actor, action, target string) error {
+	_, err := db.Exec(`INSERT INTO audit_logs (org_id, ts, actor, action, target) VALUES (?, ?, ?, ?, ?)`,
+		org, time.Now().Unix(), actor, action, target)
 	return err
 }
 
@@ -212,17 +194,13 @@ func HashToken(plain string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CreateToken mints a random API token with a role. The plaintext is returned
-// once and cannot be recovered afterwards.
-func CreateToken(db DBTX, name, role string) (string, error) {
+// CreateToken mints a random token for org with a role. The plaintext is
+// returned once and cannot be recovered afterwards.
+func CreateToken(db DBTX, org int64, name, role string) (string, error) {
 	switch role {
 	case "admin", "operator", "viewer":
 	default:
 		return "", fmt.Errorf("unknown role %q (admin|operator|viewer)", role)
-	}
-	orgID, err := DefaultOrgID(db)
-	if err != nil {
-		return "", err
 	}
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -230,17 +208,40 @@ func CreateToken(db DBTX, name, role string) (string, error) {
 	}
 	plain := "oc_" + hex.EncodeToString(buf)
 	if _, err := db.Exec(`INSERT INTO api_tokens (org_id, name, role, token_hash) VALUES (?, ?, ?, ?)`,
-		orgID, name, role, HashToken(plain)); err != nil {
+		org, name, role, HashToken(plain)); err != nil {
 		return "", err
 	}
 	return plain, nil
 }
 
-// LookupToken resolves a presented token to its name and role.
+// ListTokens returns the org's token metadata. Hashes are never returned.
+func ListTokens(db DBTX, org int64) ([]Token, error) {
+	rows, err := db.Query(`SELECT id, name, role, created_at FROM api_tokens WHERE org_id = ? ORDER BY id`, org)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Token{}
+	for rows.Next() {
+		var t Token
+		if err := rows.Scan(&t.ID, &t.Name, &t.Role, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// RevokeToken deletes one of org's tokens; its bearer is refused from the next request.
+func RevokeToken(db DBTX, org, id int64) error {
+	return deleteRow(db, `DELETE FROM api_tokens WHERE id = ? AND org_id = ?`, id, org)
+}
+
+// LookupToken resolves a presented token to its record (including org).
 func LookupToken(db DBTX, plain string) (Token, bool, error) {
 	var t Token
-	err := db.QueryRow(`SELECT id, name, role, created_at FROM api_tokens WHERE token_hash = ?`,
-		HashToken(plain)).Scan(&t.ID, &t.Name, &t.Role, &t.CreatedAt)
+	err := db.QueryRow(`SELECT id, org_id, name, role, created_at FROM api_tokens WHERE token_hash = ?`,
+		HashToken(plain)).Scan(&t.ID, &t.OrgID, &t.Name, &t.Role, &t.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Token{}, false, nil
 	}
@@ -250,8 +251,8 @@ func LookupToken(db DBTX, plain string) (Token, bool, error) {
 	return t, true, nil
 }
 
-func deleteRow(db DBTX, query string, id int64) error {
-	res, err := db.Exec(query, id)
+func deleteRow(db DBTX, query string, args ...any) error {
+	res, err := db.Exec(query, args...)
 	if err != nil {
 		return err
 	}
@@ -263,10 +264,4 @@ func deleteRow(db DBTX, query string, id int64) error {
 		return ErrNotFound
 	}
 	return nil
-}
-
-func parseCIDRList(raw string) []string {
-	var out []string
-	_ = json.Unmarshal([]byte(raw), &out)
-	return out
 }

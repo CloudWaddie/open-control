@@ -16,13 +16,15 @@ import (
 )
 
 type fixture struct {
-	t        *testing.T
-	h        http.Handler
-	db       *sql.DB
-	reloads  chan struct{}
-	admin    string
-	operator string
-	viewer   string
+	t          *testing.T
+	h          http.Handler
+	db         *sql.DB
+	reloads    chan struct{}
+	admin      string
+	operator   string
+	viewer     string
+	otherOrg   int64
+	otherAdmin string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -40,16 +42,28 @@ func newFixture(t *testing.T) *fixture {
 	}
 	f := &fixture{t: t, db: db, reloads: make(chan struct{}, 32)}
 	f.h = Handler(db, func() { f.reloads <- struct{}{} })
-	mint := func(name, role string) string {
-		tok, err := store.CreateToken(db, name, role)
+	org, err := store.DefaultOrgID(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mint := func(org int64, name, role string) string {
+		tok, err := store.CreateToken(db, org, name, role)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return tok
 	}
-	f.admin = mint("root", "admin")
-	f.operator = mint("ops", "operator")
-	f.viewer = mint("dash", "viewer")
+	f.admin = mint(org, "root", "admin")
+	f.operator = mint(org, "ops", "operator")
+	f.viewer = mint(org, "dash", "viewer")
+
+	// A second tenant with its own admin, for isolation tests.
+	other, err := store.CreateOrg(db, "other-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.otherOrg = other
+	f.otherAdmin = mint(other, "tenant-root", "admin")
 	return f
 }
 
@@ -237,6 +251,80 @@ func TestCannotRevokeOwnToken(t *testing.T) {
 	if code, _, _ := f.do("DELETE", "/api/v1/tokens/"+itoa(adminID), f.admin, ""); code != http.StatusConflict {
 		t.Errorf("self-revoke: got %d, want 409", code)
 	}
+}
+
+// Tenant isolation: a token from org B must not read, reference, change or
+// revoke anything in org A. Refusals look like "not found", never "forbidden",
+// so one tenant cannot probe another's ids.
+func TestTenantIsolation(t *testing.T) {
+	f := newFixture(t)
+	// Org A (default) creates a profile rule; capture its id.
+	code, body, raw := f.do("POST", "/api/v1/profiles/1/rules", f.operator,
+		`{"kind":"block","matcher":"domain","pattern":"a-secret.example"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("setup: %d %s", code, raw)
+	}
+	ruleID := itoa(int64(body["id"].(float64)))
+	f.waitReload()
+
+	other := f.otherAdmin
+
+	// Reads: B sees none of A's profiles, rules, endpoints, tokens or audit.
+	if _, _, raw := f.do("GET", "/api/v1/profiles", other, ""); strings.Contains(string(raw), `"default"`) {
+		t.Errorf("tenant B lists A's profiles: %s", raw)
+	}
+	if _, _, raw := f.do("GET", "/api/v1/profiles/1/rules", other, ""); strings.Contains(string(raw), "a-secret") {
+		t.Errorf("tenant B reads A's rules: %s", raw)
+	}
+	if _, _, raw := f.do("GET", "/api/v1/audit", other, ""); strings.Contains(string(raw), "rule.create") {
+		t.Errorf("tenant B reads A's audit log: %s", raw)
+	}
+	if _, _, raw := f.do("GET", "/api/v1/tokens", other, ""); strings.Contains(string(raw), `"root"`) {
+		t.Errorf("tenant B lists A's tokens: %s", raw)
+	}
+
+	// Writes that name A's objects are refused as not found.
+	if code, _, _ := f.do("POST", "/api/v1/profiles/1/rules", other,
+		`{"kind":"allow","matcher":"domain","pattern":"x.example"}`); code != http.StatusNotFound {
+		t.Errorf("B adds a rule to A's profile: %d, want 404", code)
+	}
+	if code, _, _ := f.do("DELETE", "/api/v1/rules/"+ruleID, other, ""); code != http.StatusNotFound {
+		t.Errorf("B deletes A's rule: %d, want 404", code)
+	}
+	if code, _, _ := f.do("POST", "/api/v1/endpoints", other,
+		`{"name":"sneaky","profile_id":1,"cidrs":["0.0.0.0/0"]}`); code != http.StatusNotFound {
+		t.Errorf("B binds an endpoint to A's profile: %d, want 404", code)
+	}
+	if code, _, _ := f.do("DELETE", "/api/v1/tokens/"+itoa(f.tokenID(t, "ops")), other, ""); code != http.StatusNotFound {
+		t.Errorf("B revokes A's token: %d, want 404", code)
+	}
+
+	// A's rule survived and A's operator still works.
+	if code, _, _ := f.do("GET", "/api/v1/profiles/1/rules", f.operator, ""); code != 200 {
+		t.Errorf("A's operator broken by B's attempts: %d", code)
+	}
+	var n int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM profile_rules WHERE pattern = 'a-secret.example'`).Scan(&n); err != nil || n != 1 {
+		t.Errorf("A's rule altered by tenant B: count=%d err=%v", n, err)
+	}
+
+	// B's own objects work normally.
+	if code, _, raw := f.do("POST", "/api/v1/profiles", other, `{"name":"tenant-b-profile"}`); code != http.StatusCreated {
+		t.Fatalf("B creates its own profile: %d %s", code, raw)
+	}
+	if code, _, _ := f.do("GET", "/api/v1/profiles", other, ""); code != 200 {
+		t.Errorf("B lists its own profiles: %d", code)
+	}
+}
+
+// tokenID looks up a token's id by name.
+func (f *fixture) tokenID(t *testing.T, name string) int64 {
+	t.Helper()
+	var id int64
+	if err := f.db.QueryRow(`SELECT id FROM api_tokens WHERE name = ?`, name).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func TestWhoami(t *testing.T) {
