@@ -4,7 +4,10 @@ package resolver
 
 import (
 	"log"
+	"net"
+	"net/netip"
 	"runtime/debug"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -19,19 +22,24 @@ import (
 type Resolver struct {
 	cfg       *config.Config
 	cache     *cache.Cache
-	engine    *policy.Engine
 	sf        singleflight.Group
 	upstreams []string
 	robin     atomic.Uint64
+	snapshot  atomic.Pointer[policy.Snapshot]
 	udpClient dns.Client
 	tcpClient dns.Client
+}
+
+// SetSnapshot hot-swaps the compiled policy state (loaded from the store).
+// Safe to call at any time; in-flight queries keep the old snapshot.
+func (r *Resolver) SetSnapshot(s *policy.Snapshot) {
+	r.snapshot.Store(s)
 }
 
 func New(cfg *config.Config) *Resolver {
 	return &Resolver{
 		cfg:       cfg,
 		cache:     cache.New(cfg.Cache.MaxEntries),
-		engine:    policy.New(),
 		upstreams: cfg.Upstreams,
 		udpClient: dns.Client{Net: "udp", Timeout: 3 * time.Second, UDPSize: 4096},
 		tcpClient: dns.Client{Net: "tcp", Timeout: 5 * time.Second},
@@ -82,7 +90,38 @@ func (r *Resolver) handle(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 	q := req.Question[0]
+	clientIP := clientIP(clientAddr)
 	key := cache.MakeKey(req)
+
+	// Policy evaluation (M1): endpoint → profile → decision (PLAN.md §1).
+	snap := r.snapshot.Load()
+	if snap != nil {
+		var prof *policy.Profile
+		if ep := snap.EndpointForClientIP(clientIP); ep != nil {
+			prof = snap.ProfileForEndpoint(ep.ProfileID)
+		}
+		if prof == nil {
+			// No endpoint match: fall back to the default org's first profile
+			// so a local query never escapes filtering.
+			prof = snap.DefaultProfile()
+		}
+		if prof != nil {
+			d := snap.Evaluate(prof, q.Name)
+			switch d.Action {
+			case policy.ActionBlock:
+				log.Printf("resolver: BLOCK %s (%s) via %s", q.Name, d.Reason, clientAddr)
+				_ = w.WriteMsg(refusal(req, dns.RcodeNameError))
+				return
+			case policy.ActionRewrite:
+				log.Printf("resolver: REWRITE %s -> %s via %s", q.Name, d.Target, clientAddr)
+				_ = w.WriteMsg(rewriteReply(req, q, d.Target))
+				return
+			case policy.ActionRedirect:
+				// Egress phase (PLAN.md M5): forward until exits exist.
+				log.Printf("resolver: REDIRECT %s stubbed (%s), forwarding", q.Name, d.Reason)
+			}
+		}
+	}
 
 	// Cache: serve the response if we still have it.
 	if msg := r.cache.Get(key, req.Id); msg != nil {
@@ -173,4 +212,39 @@ func refusal(req *dns.Msg, code int) *dns.Msg {
 	m.SetReply(req)
 	m.Rcode = code
 	return m
+}
+
+// clientIP extracts the client address (without port) as netip.Addr.
+func clientIP(clientAddr string) netip.Addr {
+	if ap, err := netip.ParseAddrPort(clientAddr); err == nil {
+		return ap.Addr()
+	}
+	var zero netip.Addr
+	return zero
+}
+
+// rewriteReply answers a REWRITE decision directly, M1 semantics:
+// target parses as IPv4 → A, IPv6 → AAAA, otherwise CNAME.
+func rewriteReply(req *dns.Msg, q dns.Question, target string) *dns.Msg {
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	ip := net.ParseIP(target)
+	switch {
+	case ip != nil && ip.To4() != nil && q.Qtype == dns.TypeA:
+		resp.Answer = append(resp.Answer, &dns.A{
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   ip.To4(),
+		})
+	case ip != nil && ip.To4() == nil && ip.To16() != nil && q.Qtype == dns.TypeAAAA:
+		resp.Answer = append(resp.Answer, &dns.AAAA{
+			Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+			AAAA: ip,
+		})
+	default:
+		resp.Answer = append(resp.Answer, &dns.CNAME{
+			Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300},
+			Target: dns.Fqdn(strings.TrimSuffix(target, ".")),
+		})
+	}
+	return resp
 }

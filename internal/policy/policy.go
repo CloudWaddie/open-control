@@ -31,7 +31,8 @@ func (a Action) String() string {
 // Decision is the outcome of evaluating a query against a profile.
 type Decision struct {
 	Action Action
-	Reason string // machine-readable cause, e.g. "blocklist:hagezi", "custom:allow"
+	Reason string // machine-readable cause, e.g. "custom:block:tracker.example", "blocklist:ads.example"
+	Target string // rewrite/redirect target when Action == REWRITE
 }
 
 // Engine is the M0 stub: everything forwards, no lists loaded yet.
