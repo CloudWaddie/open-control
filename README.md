@@ -33,6 +33,30 @@ opencontrol addlist https://example.org/hosts hosts
 opencontrol sync                                  # fetch blocklists now
 ```
 
+## Control API (M2, partial)
+
+Listens on `OC_API_LISTEN` (default `127.0.0.1:8080`). Authenticate with a
+bearer token minted by `opencontrol addtoken NAME admin|operator|viewer`.
+
+| Role     | Can                                                        |
+|----------|------------------------------------------------------------|
+| viewer   | read profiles, rules, endpoints, blocklists                |
+| operator | viewer + create/delete rules, endpoints, blocklists, profiles |
+| admin    | operator + mint tokens, read the audit log                 |
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/profiles
+curl -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"kind":"block","matcher":"wildcard","pattern":"evil.example"}' \
+     http://127.0.0.1:8080/api/v1/profiles/1/rules
+```
+
+Every write is audited (`GET /api/v1/audit`, admin) and reloads the resolver
+immediately. Tokens are stored as SHA-256 hashes and shown once at creation.
+
+Not yet: multiple orgs (everything is scoped to the default org), user accounts
+and OIDC, the web UI, and an atomic write+audit transaction.
+
 ## Local development (no Docker)
 
 ```sh
