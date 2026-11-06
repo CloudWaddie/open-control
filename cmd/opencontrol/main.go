@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/cloudwaddie/opencontrol/internal/config"
 	"github.com/cloudwaddie/opencontrol/internal/control"
+	"github.com/cloudwaddie/opencontrol/internal/qlog"
 	"github.com/cloudwaddie/opencontrol/internal/resolver"
 	"github.com/cloudwaddie/opencontrol/internal/store"
 )
@@ -181,7 +183,27 @@ func runServe(cfgPath string) {
 		log.Fatalf("policy snapshot: %v", err)
 	}
 
+	// Query log: decisions are recorded without blocking DNS; a background writer
+	// batches them into SQLite and fans them out to the configured sinks.
+	var sinks []qlog.Sink
+	if cfg.WebhookURL != "" {
+		sinks = append(sinks, qlog.NewWebhook(cfg.WebhookURL))
+	}
+	if cfg.SyslogAddr != "" {
+		sl, err := qlog.NewSyslog(cfg.SyslogAddr)
+		if err != nil {
+			log.Fatalf("query log: %v", err)
+		}
+		sinks = append(sinks, sl)
+	}
+	logger := qlog.New(db, cfg.LogBuffer, sinks...)
+	bg, stopBG := context.WithCancel(context.Background())
+	defer stopBG()
+	go logger.Run(bg)
+	go qlog.Retention(bg, db, cfg.LogRetentionDays)
+
 	r := resolver.New(cfg)
+	r.SetRecorder(logger)
 	r.SetSnapshot(snap)
 	log.Printf("policy snapshot loaded (cached lists): %s", snap.Summary())
 

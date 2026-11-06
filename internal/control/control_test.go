@@ -352,6 +352,45 @@ func TestRotateEndpointToken(t *testing.T) {
 	}
 }
 
+// Query log and stats are tenant-scoped and validate their parameters.
+func TestLogsAndStatsAreTenantScoped(t *testing.T) {
+	f := newFixture(t)
+	defOrg, _ := store.DefaultOrgID(f.db)
+	now := time.Now().Unix()
+	if err := store.InsertQueryLogs(f.db, []store.QueryLog{
+		{Org: defOrg, Client: "10.0.0.1", QName: "default-only.example", QType: "A", Action: "block", Ts: now},
+		{Org: f.otherOrg, Client: "192.0.2.1", QName: "other-only.example", QType: "A", Action: "block", Ts: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, raw := f.do("GET", "/api/v1/logs", f.viewer, "")
+	if !strings.Contains(string(raw), "default-only.example") || strings.Contains(string(raw), "other-only.example") {
+		t.Errorf("default org logs wrong: %s", raw)
+	}
+	_, _, raw = f.do("GET", "/api/v1/logs", f.otherAdmin, "")
+	if !strings.Contains(string(raw), "other-only.example") || strings.Contains(string(raw), "default-only.example") {
+		t.Errorf("tenant B logs wrong: %s", raw)
+	}
+
+	code, st, raw := f.do("GET", "/api/v1/stats?window=1h", f.viewer, "")
+	if code != 200 || st["total"].(float64) != 1 || st["blocked"].(float64) != 1 {
+		t.Errorf("default org stats: %d %s", code, raw)
+	}
+	if _, _, raw := f.do("GET", "/api/v1/stats", f.otherAdmin, ""); !strings.Contains(string(raw), `"total":1`) {
+		t.Errorf("tenant B stats: %s", raw)
+	}
+
+	for _, p := range []string{"/api/v1/logs?action=nuke", "/api/v1/logs?limit=0", "/api/v1/logs?after=-1", "/api/v1/stats?window=5y"} {
+		if code, _, _ := f.do("GET", p, f.viewer, ""); code != http.StatusBadRequest {
+			t.Errorf("%s: %d, want 400", p, code)
+		}
+	}
+	if code, _, _ := f.do("GET", "/api/v1/logs", "", ""); code != http.StatusUnauthorized {
+		t.Errorf("logs without token: %d, want 401", code)
+	}
+}
+
 func TestWhoami(t *testing.T) {
 	f := newFixture(t)
 	code, body, _ := f.do("GET", "/api/v1/whoami", f.operator, "")

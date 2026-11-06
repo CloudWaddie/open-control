@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 
 	"github.com/cloudwaddie/opencontrol/internal/config"
 	"github.com/cloudwaddie/opencontrol/internal/policy"
+	"github.com/cloudwaddie/opencontrol/internal/store"
 )
 
 const (
@@ -250,6 +252,44 @@ func TestDoHPathToken(t *testing.T) {
 	}
 	if res, _ := client.Get(srv.URL + "/dns-query/" + tokA + "/extra"); res.StatusCode != http.StatusNotFound {
 		t.Errorf("extra path segment: status %d, want 404", res.StatusCode)
+	}
+}
+
+type captureRecorder struct {
+	mu  sync.Mutex
+	got []store.QueryLog
+}
+
+func (c *captureRecorder) Record(e store.QueryLog) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.got = append(c.got, e)
+}
+
+// Every decision is recorded with its action, endpoint and client address.
+func TestDecisionsAreRecorded(t *testing.T) {
+	r := newTestResolver(t)
+	rec := &captureRecorder{}
+	r.SetRecorder(rec)
+
+	r.answer(query("ads.test"), client{addr: "203.0.113.5:1", token: tokA})
+	r.answer(query("ads.test"), client{addr: "203.0.113.5:1", token: tokB})
+	r.answer(query("ads.test"), client{addr: "203.0.113.5:1", token: strings.Repeat("f", 32)})
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.got) != 3 {
+		t.Fatalf("recorded %d events, want 3", len(rec.got))
+	}
+	block, rewrite, refused := rec.got[0], rec.got[1], rec.got[2]
+	if block.Action != "block" || block.Endpoint != 1 || block.Client != "203.0.113.5" || block.QName != "ads.test" || block.QType != "A" {
+		t.Errorf("block event: %+v", block)
+	}
+	if rewrite.Action != "rewrite" || rewrite.Endpoint != 2 || rewrite.Reason != "10.9.9.9" {
+		t.Errorf("rewrite event: %+v", rewrite)
+	}
+	if refused.Action != "refused" || refused.Org != 0 || refused.Endpoint != 0 {
+		t.Errorf("refused event should be unattributed: %+v", refused)
 	}
 }
 

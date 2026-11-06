@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cloudwaddie/opencontrol/internal/store"
 	"github.com/cloudwaddie/opencontrol/internal/web"
@@ -69,6 +70,9 @@ func Handler(db *sql.DB, reload func()) http.Handler {
 	mux.Handle("GET /api/v1/blocklists", s.require("viewer", s.listBlocklists))
 	mux.Handle("POST /api/v1/blocklists", s.require("operator", s.createBlocklist))
 	mux.Handle("DELETE /api/v1/blocklists/{id}", s.require("operator", s.deleteBlocklist))
+
+	mux.Handle("GET /api/v1/logs", s.require("viewer", s.listLogs))
+	mux.Handle("GET /api/v1/stats", s.require("viewer", s.stats))
 
 	mux.Handle("GET /api/v1/audit", s.require("admin", s.listAudit))
 	mux.Handle("GET /api/v1/tokens", s.require("admin", s.listTokens))
@@ -357,6 +361,62 @@ func (s *Server) deleteBlocklist(w http.ResponseWriter, r *http.Request) {
 		}
 		return result{target: "blocklist " + strconv.FormatInt(id, 10), status: http.StatusNoContent}, nil
 	})
+}
+
+// --- query log (M4) ---
+
+var logActions = map[string]bool{"block": true, "forward": true, "rewrite": true, "refused": true, "error": true}
+
+// listLogs returns the org's newest decisions. ?after=<id> returns only newer
+// rows, which is how the UI tails the log.
+func (s *Server) listLogs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var f store.LogFilter
+	if v := q.Get("after"); v != "" {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || id < 0 {
+			writeErr(w, http.StatusBadRequest, "after must be a non-negative integer")
+			return
+		}
+		f.AfterID = id
+	}
+	if v := q.Get("action"); v != "" {
+		if !logActions[v] {
+			writeErr(w, http.StatusBadRequest, "action must be one of block|forward|rewrite|refused|error")
+			return
+		}
+		f.Action = v
+	}
+	f.Client = q.Get("client")
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		f.Limit = n
+	}
+	out, err := store.ListQueryLogs(s.db, principalOf(r).org, f)
+	respond(w, out, err)
+}
+
+var statsWindows = map[string]time.Duration{"1h": time.Hour, "24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour}
+
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("window")
+	if name == "" {
+		name = "1h"
+	}
+	window, ok := statsWindows[name]
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "window must be 1h, 24h or 7d")
+		return
+	}
+	out, err := store.QueryStats(s.db, principalOf(r).org, window, time.Now())
+	if err == nil {
+		out.Window = name
+	}
+	respond(w, out, err)
 }
 
 // --- admin ---

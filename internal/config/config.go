@@ -2,7 +2,9 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
@@ -14,6 +16,10 @@ type Config struct {
 	DoHListen   string      `yaml:"doh_listen"`   // host:port for DNS-over-HTTPS (empty = off)
 	TLSCert     string      `yaml:"tls_cert"`     // PEM certificate chain for DoT/DoH
 	TLSKey      string      `yaml:"tls_key"`      // PEM private key for DoT/DoH
+	LogRetentionDays int    `yaml:"log_retention_days"` // query-log rows older than this are purged
+	LogBuffer        int    `yaml:"log_buffer"`         // events buffered before drops begin
+	SyslogAddr       string `yaml:"syslog_addr"`        // host:port, UDP syslog sink (empty = off)
+	WebhookURL       string `yaml:"webhook_url"`        // POST batches of query-log JSON (empty = off)
 	Upstreams   []string    `yaml:"upstreams"`    // plain-DNS upstreams, e.g. 1.1.1.1:53
 	SQLitePath  string      `yaml:"sqlite_path"`  // database file
 	DataDir     string      `yaml:"data_dir"`     // state dir (blocklists, later)
@@ -30,6 +36,8 @@ func Default() Config {
 	return Config{
 		Listen:     "127.0.0.1:1053",
 		APIListen:  "127.0.0.1:8080",
+		LogRetentionDays: 7,
+		LogBuffer:        4096,
 		Upstreams:  []string{"1.1.1.1:53", "8.8.8.8:53"},
 		SQLitePath: "data/opencontrol.db",
 		DataDir:    "data",
@@ -71,6 +79,19 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("OC_TLS_KEY"); v != "" {
 		cfg.TLSKey = v
+	}
+	if v := os.Getenv("OC_LOG_RETENTION_DAYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("OC_LOG_RETENTION_DAYS must be a non-negative integer, got %q", v)
+		}
+		cfg.LogRetentionDays = n
+	}
+	if v := os.Getenv("OC_SYSLOG_ADDR"); v != "" {
+		cfg.SyslogAddr = v
+	}
+	if v := os.Getenv("OC_WEBHOOK_URL"); v != "" {
+		cfg.WebhookURL = v
 	}
 	if v := os.Getenv("OC_SQLITE_PATH"); v != "" {
 		cfg.SQLitePath = v

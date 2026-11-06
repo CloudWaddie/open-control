@@ -44,6 +44,27 @@ Node. To change the UI: `cd web && npm install && npm run build`.
 Pages: profiles and rules, endpoints (shows the token once), blocklists, tokens
 (admin: mint and revoke), audit log (admin).
 
+## Query log, stats, and streaming (M4)
+
+Every resolver decision is recorded: time, client, name, type, action (`block`,
+`forward`, `rewrite`, `refused`, `error`), and reason. Recording never blocks DNS.
+If the buffer fills (`log_buffer`, default 4096), events are dropped rather than
+slowing answers. Rows are written in batches about once a second.
+
+- **Overview** (UI): queries, blocked count and share, top blocked domains, top
+  clients, most queried domains, for the last hour, day, or week.
+- **Logs** (UI): live tail with action and client filters.
+- **API** (any role): `GET /api/v1/logs?after=&action=&client=&limit=` and
+  `GET /api/v1/stats?window=1h|24h|7d`.
+- **Retention:** rows older than `OC_LOG_RETENTION_DAYS` (default 7) are purged
+  hourly. `0` keeps everything.
+- **Sinks:** `OC_WEBHOOK_URL` receives each batch as a JSON array (POST). `OC_SYSLOG_ADDR`
+  receives one RFC 5424-shaped UDP line per event. Sinks are operator-level, so they
+  receive every org's events. Per-org sinks are not built yet. Failed sink sends are
+  logged, not retried.
+
+Unknown-token refusals have no org, so they are stored but never shown to a tenant.
+
 ## Organizations (tenants)
 
 Every token belongs to one org and sees only that org's data. A cross-org

@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, can, getToken, setToken } from './api.js';
+import Overview from './views/Overview.jsx';
+import Logs from './views/Logs.jsx';
 import Profiles from './views/Profiles.jsx';
 import Endpoints from './views/Endpoints.jsx';
 import Blocklists from './views/Blocklists.jsx';
@@ -9,6 +11,8 @@ import Audit from './views/Audit.jsx';
 // Each nav entry names the minimum role it needs. Viewers see read-only
 // versions of the first three; tokens and audit are admin-only.
 const NAV = [
+  { id: 'overview', label: 'Overview', min: 'viewer', view: Overview },
+  { id: 'logs', label: 'Logs', min: 'viewer', view: Logs },
   { id: 'profiles', label: 'Profiles', min: 'viewer', view: Profiles },
   { id: 'endpoints', label: 'Endpoints', min: 'viewer', view: Endpoints },
   { id: 'blocklists', label: 'Blocklists', min: 'viewer', view: Blocklists },
@@ -17,7 +21,7 @@ const NAV = [
 ];
 
 function currentRoute() {
-  return window.location.hash.replace(/^#\/?/, '') || 'profiles';
+  return window.location.hash.replace(/^#\/?/, '') || 'overview';
 }
 
 export default function App() {

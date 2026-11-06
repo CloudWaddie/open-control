@@ -1,5 +1,5 @@
 // Package resolver wires miekg/dns into the Open Control serving path:
-// UDP/TCP/DoT/DoH listeners, cache, upstream pool, policy hook.
+// UDP/TCP/DoT/DoH listeners, cache, upstream pool, policy hook, query log.
 //
 // Every transport calls answer(), so the policy decision is identical for all
 // of them. Only the way the client's identity is read differs:
@@ -33,7 +33,14 @@ import (
 	"github.com/cloudwaddie/opencontrol/internal/cache"
 	"github.com/cloudwaddie/opencontrol/internal/config"
 	"github.com/cloudwaddie/opencontrol/internal/policy"
+	"github.com/cloudwaddie/opencontrol/internal/store"
 )
+
+// Recorder receives one entry per decision. qlog.Logger satisfies it; its
+// Record must not block.
+type Recorder interface {
+	Record(store.QueryLog)
+}
 
 type Resolver struct {
 	cfg       *config.Config
@@ -42,6 +49,7 @@ type Resolver struct {
 	upstreams []string
 	robin     atomic.Uint64
 	snapshot  atomic.Pointer[policy.Snapshot]
+	recorder  atomic.Pointer[Recorder]
 	udpClient dns.Client
 	tcpClient dns.Client
 }
@@ -50,6 +58,11 @@ type Resolver struct {
 // Safe to call at any time; in-flight queries keep the old snapshot.
 func (r *Resolver) SetSnapshot(s *policy.Snapshot) {
 	r.snapshot.Store(s)
+}
+
+// SetRecorder installs the query-log sink. Without one, decisions are not logged.
+func (r *Resolver) SetRecorder(rec Recorder) {
+	r.recorder.Store(&rec)
 }
 
 func New(cfg *config.Config) *Resolver {
@@ -69,17 +82,46 @@ type client struct {
 	token string
 }
 
+// verdict is what a decision concluded, for the query log.
+type verdict struct {
+	org      int64 // 0 when the query could not be attributed to an org
+	endpoint int64 // 0 when no endpoint matched (default profile)
+	action   string
+	reason   string
+}
+
 // answer decides and produces the reply for one query. It never returns nil,
 // and a panic inside becomes SERVFAIL rather than a silent drop.
-func (r *Resolver) answer(req *dns.Msg, c client) (resp *dns.Msg) {
+func (r *Resolver) answer(req *dns.Msg, c client) *dns.Msg {
+	var v verdict
+	resp := r.decide(req, c, &v)
+	if rec := r.recorder.Load(); rec != nil && req != nil && len(req.Question) == 1 {
+		q := req.Question[0]
+		(*rec).Record(store.QueryLog{
+			Org:      v.org,
+			Endpoint: v.endpoint,
+			Ts:       time.Now().Unix(),
+			Client:   clientHost(c.addr),
+			QName:    strings.ToLower(strings.TrimSuffix(q.Name, ".")),
+			QType:    dns.TypeToString[q.Qtype],
+			Action:   v.action,
+			Reason:   v.reason,
+		})
+	}
+	return resp
+}
+
+func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("resolver: panic from client %s: %v\n%s", c.addr, rec, debug.Stack())
+			v.action, v.reason = "error", "panic"
 			resp = refusal(req, dns.RcodeServerFailure)
 		}
 	}()
 
 	if req == nil || req.Opcode != dns.OpcodeQuery || len(req.Question) != 1 {
+		v.action, v.reason = "error", "not-a-query"
 		return refusal(req, dns.RcodeNotImplemented)
 	}
 	q := req.Question[0]
@@ -92,30 +134,38 @@ func (r *Resolver) answer(req *dns.Msg, c client) (resp *dns.Msg) {
 			ep := snap.EndpointForToken(c.token)
 			if ep == nil {
 				log.Printf("resolver: REFUSED %s — unknown endpoint token via %s", q.Name, c.addr)
+				v.action, v.reason = "refused", "unknown-token"
 				return refusal(req, dns.RcodeRefused)
 			}
 			prof = snap.ProfileForEndpoint(ep.ProfileID)
 			if prof == nil {
+				v.action, v.reason = "refused", "no-profile"
 				return refusal(req, dns.RcodeRefused)
 			}
+			v.endpoint = ep.ID
 		} else {
 			if ep := snap.EndpointForClientIP(clientIP(c.addr)); ep != nil {
 				prof = snap.ProfileForEndpoint(ep.ProfileID)
+				v.endpoint = ep.ID
 			}
 			if prof == nil {
 				// No endpoint match: fall back to the default org's first profile
 				// so a local query never escapes filtering.
 				prof = snap.DefaultProfile()
+				v.endpoint = 0
 			}
 		}
 		if prof != nil {
+			v.org = prof.OrgID
 			d := snap.Evaluate(prof, q.Name)
 			switch d.Action {
 			case policy.ActionBlock:
 				log.Printf("resolver: BLOCK %s (%s) via %s", q.Name, d.Reason, c.addr)
+				v.action, v.reason = "block", d.Reason
 				return refusal(req, dns.RcodeNameError)
 			case policy.ActionRewrite:
 				log.Printf("resolver: REWRITE %s -> %s via %s", q.Name, d.Target, c.addr)
+				v.action, v.reason = "rewrite", d.Target
 				return rewriteReply(req, q, d.Target)
 			case policy.ActionRedirect:
 				// Egress phase (PLAN.md M5): forward until exits exist.
@@ -126,15 +176,17 @@ func (r *Resolver) answer(req *dns.Msg, c client) (resp *dns.Msg) {
 
 	// Cache: serve the response if we still have it.
 	if msg := r.cache.Get(key, req.Id); msg != nil {
+		v.action, v.reason = "forward", "cache"
 		return msg
 	}
 
 	// Single in-flight upstream fetch per key (PLAN.md M0, recovery).
-	v, _, _ := r.sf.Do(key, func() (any, error) {
+	res, _, _ := r.sf.Do(key, func() (any, error) {
 		return r.forward(&q), nil
 	})
-	up, _ := v.(*dns.Msg)
+	up, _ := res.(*dns.Msg)
 	if up == nil {
+		v.action, v.reason = "error", "upstream"
 		return refusal(req, dns.RcodeServerFailure)
 	}
 
@@ -142,6 +194,7 @@ func (r *Resolver) answer(req *dns.Msg, c client) (resp *dns.Msg) {
 	if ttl := minTTL(up); ttl > 0 {
 		r.cache.Put(key, up, ttl)
 	}
+	v.action, v.reason = "forward", "upstream"
 	out := up.Copy()
 	out.Id = req.Id
 	return out
@@ -293,6 +346,14 @@ func remoteAddr(w dns.ResponseWriter) string {
 	return "unknown"
 }
 
+// clientHost is the address without its port, for the query log.
+func clientHost(addr string) string {
+	if ap, err := netip.ParseAddrPort(addr); err == nil {
+		return ap.Addr().String()
+	}
+	return addr
+}
+
 // forward sends the question to the next upstream, UDP first with TCP fallback
 // on truncation. On success the returned message already has TTL clamps applied
 // so the cache can immediately reuse the same message.
@@ -393,4 +454,3 @@ func rewriteReply(req *dns.Msg, q dns.Question, target string) *dns.Msg {
 	}
 	return resp
 }
-

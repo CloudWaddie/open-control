@@ -198,14 +198,14 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 
 	// Endpoints (with source allowlists).
 	var eps []*policy.Endpoint
-	rows, err = db.Query(`SELECT id, name, profile_id, allowed_source_ips, token FROM endpoints`)
+	rows, err = db.Query(`SELECT id, name, profile_id, allowed_source_ips, token, org_id FROM endpoints`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var e policy.Endpoint
 		var allowed string
-		if err := rows.Scan(&e.ID, &e.Name, &e.ProfileID, &allowed, &e.TokenHash); err != nil {
+		if err := rows.Scan(&e.ID, &e.Name, &e.ProfileID, &allowed, &e.TokenHash, &e.OrgID); err != nil {
 			rows.Close()
 			return nil, err
 		}

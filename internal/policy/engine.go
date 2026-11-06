@@ -15,6 +15,7 @@ import (
 type Endpoint struct {
 	ID        int64
 	Name      string
+	OrgID     int64
 	ProfileID int64
 	Allowed   *cidrSet // allowed source networks; nil = accept any
 	TokenHash string   // HashSecret(token); "" = no token (source-IP only)
