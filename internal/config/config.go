@@ -9,6 +9,7 @@ import (
 
 type Config struct {
 	Listen      string      `yaml:"listen"`       // host:port for UDP53/TCP listeners
+	APIListen   string      `yaml:"api_listen"`   // host:port for the REST control plane
 	Upstreams   []string    `yaml:"upstreams"`    // plain-DNS upstreams, e.g. 1.1.1.1:53
 	SQLitePath  string      `yaml:"sqlite_path"`  // database file
 	DataDir     string      `yaml:"data_dir"`     // state dir (blocklists, later)
@@ -24,6 +25,7 @@ type CacheConfig struct {
 func Default() Config {
 	return Config{
 		Listen:     "127.0.0.1:1053",
+		APIListen:  "127.0.0.1:8080",
 		Upstreams:  []string{"1.1.1.1:53", "8.8.8.8:53"},
 		SQLitePath: "data/opencontrol.db",
 		DataDir:    "data",
@@ -50,6 +52,9 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("OC_LISTEN"); v != "" {
 		cfg.Listen = v
+	}
+	if v := os.Getenv("OC_API_LISTEN"); v != "" {
+		cfg.APIListen = v
 	}
 	if v := os.Getenv("OC_SQLITE_PATH"); v != "" {
 		cfg.SQLitePath = v

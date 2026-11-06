@@ -30,7 +30,7 @@ func TestSnapshotDecisions(t *testing.T) {
 		{"block", "tld", "xyz", ""},
 	}
 	for _, r := range rules {
-		if err := AddRule(db, 1, r[0], r[1], r[2], r[3]); err != nil {
+		if _, err := AddRule(db, 1, r[0], r[1], r[2], r[3]); err != nil {
 			t.Fatalf("AddRule %v: %v", r, err)
 		}
 	}

@@ -194,29 +194,32 @@ func LoadSnapshot(db *sql.DB, dataDir string, fetch bool) (*policy.Snapshot, err
 
 // AddRule inserts a custom rule row (admin CLI for M1; M2 gets the API+UI).
 // pattern is the domain (or ".tld"); answer is only used by rewrite rules.
-func AddRule(db *sql.DB, profileID int64, kind, matcher, pattern, answer string) error {
+func AddRule(db *sql.DB, profileID int64, kind, matcher, pattern, answer string) (int64, error) {
 	switch kind {
 	case "block", "allow", "rewrite", "redirect":
 	default:
-		return fmt.Errorf("unknown rule kind %q", kind)
+		return 0, fmt.Errorf("unknown rule kind %q", kind)
 	}
 	switch matcher {
 	case "domain", "wildcard", "tld":
 	default:
-		return fmt.Errorf("unknown matcher %q", matcher)
+		return 0, fmt.Errorf("unknown matcher %q", matcher)
 	}
 	if matcher == "tld" {
 		pattern = "." + strings.Trim(pattern, ".")
 	}
 	if pattern == "" || pattern == "." {
-		return fmt.Errorf("empty pattern")
+		return 0, fmt.Errorf("empty pattern")
 	}
 	if kind == "rewrite" && (matcher != "domain" || answer == "") {
-		return fmt.Errorf("rewrite needs an exact domain and an answer (IP or name)")
+		return 0, fmt.Errorf("rewrite needs an exact domain and an answer (IP or name)")
 	}
-	_, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, pattern, answer) VALUES (?, ?, ?, ?, ?)`,
+	res, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, pattern, answer) VALUES (?, ?, ?, ?, ?)`,
 		profileID, kind, matcher, pattern, answer)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
 // AddProfile creates a profile on the default org and returns its id.

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cloudwaddie/opencontrol/internal/config"
+	"github.com/cloudwaddie/opencontrol/internal/control"
 	"github.com/cloudwaddie/opencontrol/internal/resolver"
 	"github.com/cloudwaddie/opencontrol/internal/store"
 )
@@ -28,6 +30,7 @@ Usage:
                                         matchers:   domain|wildcard|tld
                                         rewrite:    domain + ANSWER (IP or name)
   opencontrol addlist URL [FORMAT]      subscribe to a blocklist (hosts|dnsmasq|adguard)
+  opencontrol addtoken NAME ROLE        mint an API token (admin|operator|viewer), printed once
   opencontrol addprofile NAME           create a profile, prints its id
   opencontrol addendpoint NAME PROFILE_ID CIDR[,CIDR...]
                                         create an endpoint; clients in CIDRs get PROFILE
@@ -88,6 +91,19 @@ func main() {
 		}
 		log.Printf("addendpoint: %s (id %d) → profile %d, sources %s", flag.Arg(1), id, profileID, flag.Arg(3))
 		fmt.Println(token)
+	case "addtoken":
+		if flag.NArg() < 3 {
+			fmt.Fprint(os.Stderr, "usage: opencontrol addtoken NAME admin|operator|viewer\n")
+			os.Exit(2)
+		}
+		_, db := openDB(*cfgPath)
+		defer db.Close()
+		tok, err := store.CreateToken(db, flag.Arg(1), flag.Arg(2))
+		if err != nil {
+			log.Fatalf("addtoken: %v", err)
+		}
+		log.Printf("addtoken: %s (%s) — copy it now, it is not shown again", flag.Arg(1), flag.Arg(2))
+		fmt.Println(tok)
 	case "addlist":
 		if flag.NArg() < 2 {
 			fmt.Fprint(os.Stderr, "usage: opencontrol addlist URL [FORMAT]\n")
@@ -166,6 +182,19 @@ func runServe(cfgPath string) {
 		}
 	}()
 
+	// Control plane. Writes reload the snapshot immediately.
+	api := &http.Server{
+		Addr:              cfg.APIListen,
+		Handler:           control.Handler(db, func() { reload(false) }),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		log.Printf("control: API listening on %s", cfg.APIListen)
+		if err := api.ListenAndServe(); err != nil {
+			log.Fatalf("control: %v", err)
+		}
+	}()
+
 	if err := r.ListenAndServe(); err != nil {
 		log.Fatalf("resolver: %v", err)
 	}
@@ -208,7 +237,7 @@ func runAddRule(cfgPath string, args []string) {
 	if len(args) > 4 {
 		answer = args[4] // rewrite answer; ignored by other kinds
 	}
-	if err := store.AddRule(db, profileID, kind, matcher, pattern, answer); err != nil {
+	if _, err := store.AddRule(db, profileID, kind, matcher, pattern, answer); err != nil {
 		log.Fatalf("addrule: %v", err)
 	}
 	log.Printf("addrule: %s %s %s → profile %d (applies on next snapshot reload; restart serve to apply now)", kind, matcher, pattern, profileID)
