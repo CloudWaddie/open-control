@@ -10,6 +10,10 @@ import (
 type Config struct {
 	Listen      string      `yaml:"listen"`       // host:port for UDP53/TCP listeners
 	APIListen   string      `yaml:"api_listen"`   // host:port for the REST control plane
+	DoTListen   string      `yaml:"dot_listen"`   // host:port for DNS-over-TLS (empty = off)
+	DoHListen   string      `yaml:"doh_listen"`   // host:port for DNS-over-HTTPS (empty = off)
+	TLSCert     string      `yaml:"tls_cert"`     // PEM certificate chain for DoT/DoH
+	TLSKey      string      `yaml:"tls_key"`      // PEM private key for DoT/DoH
 	Upstreams   []string    `yaml:"upstreams"`    // plain-DNS upstreams, e.g. 1.1.1.1:53
 	SQLitePath  string      `yaml:"sqlite_path"`  // database file
 	DataDir     string      `yaml:"data_dir"`     // state dir (blocklists, later)
@@ -55,6 +59,18 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("OC_API_LISTEN"); v != "" {
 		cfg.APIListen = v
+	}
+	if v := os.Getenv("OC_DOT_LISTEN"); v != "" {
+		cfg.DoTListen = v
+	}
+	if v := os.Getenv("OC_DOH_LISTEN"); v != "" {
+		cfg.DoHListen = v
+	}
+	if v := os.Getenv("OC_TLS_CERT"); v != "" {
+		cfg.TLSCert = v
+	}
+	if v := os.Getenv("OC_TLS_KEY"); v != "" {
+		cfg.TLSKey = v
 	}
 	if v := os.Getenv("OC_SQLITE_PATH"); v != "" {
 		cfg.SQLitePath = v

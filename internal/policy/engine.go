@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -15,6 +17,14 @@ type Endpoint struct {
 	Name      string
 	ProfileID int64
 	Allowed   *cidrSet // allowed source networks; nil = accept any
+	TokenHash string   // HashSecret(token); "" = no token (source-IP only)
+}
+
+// HashSecret is the storage form of a bearer-style secret (API token, endpoint
+// token). The input is high-entropy random, so a fast hash is appropriate.
+func HashSecret(plain string) string {
+	sum := sha256.Sum256([]byte(plain))
+	return hex.EncodeToString(sum[:])
 }
 
 // Profile is a compiled policy bundle.
@@ -35,12 +45,29 @@ type RewriteRecord struct {
 // Snapshot is the immutable compiled state served by the resolver.
 type Snapshot struct {
 	endpoints []*Endpoint
+	byToken   map[string]*Endpoint
 	profiles  map[int64]*Profile
 }
 
 // NewSnapshot assembles an immutable snapshot from loaded endpoints/profiles.
 func NewSnapshot(endpoints []*Endpoint, profiles map[int64]*Profile) *Snapshot {
-	return &Snapshot{endpoints: endpoints, profiles: profiles}
+	s := &Snapshot{endpoints: endpoints, profiles: profiles, byToken: map[string]*Endpoint{}}
+	for _, e := range endpoints {
+		if e.TokenHash != "" {
+			s.byToken[e.TokenHash] = e
+		}
+	}
+	return s
+}
+
+// EndpointForToken finds the endpoint a presented DoH/DoT token belongs to.
+// The token itself identifies the endpoint, so the source-IP allowlist is not
+// consulted: encrypted clients roam between networks. Unknown token → nil.
+func (s *Snapshot) EndpointForToken(plain string) *Endpoint {
+	if plain == "" {
+		return nil
+	}
+	return s.byToken[HashSecret(plain)]
 }
 
 func (s *Snapshot) ProfileForEndpoint(id int64) *Profile {

@@ -55,6 +55,18 @@ export default function Endpoints({ me }) {
     }
   }
 
+  // Rotating invalidates the previous token immediately, so anything using it
+  // (a phone's Private DNS, a router) must be updated with the new one.
+  async function rotate(e) {
+    setError('');
+    try {
+      const res = await api('POST', `/endpoints/${e.id}/rotate`);
+      setCreated({ endpoint: e, token: res.token, rotated: true });
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   return (
     <div className="stack">
       <section className="card">
@@ -85,7 +97,12 @@ export default function Endpoints({ me }) {
                   <td>{profileName(e.profile_id)}</td>
                   <td><code>{e.cidrs.join(', ')}</code></td>
                   <td>
-                    {writable && <Confirm label="delete" onConfirm={() => remove(e.id)} />}
+                    {writable && (
+                      <>
+                        <Confirm label="rotate token" onConfirm={() => rotate(e)} />{' '}
+                        <Confirm label="delete" onConfirm={() => remove(e.id)} />
+                      </>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -97,8 +114,12 @@ export default function Endpoints({ me }) {
       {created && (
         <section className="card notice">
           <p>
-            Endpoint <strong>{created.endpoint.name}</strong> created. Token
-            (an identifier for future DoT/DoH enrollment, not a secret):
+            {created.rotated
+              ? <>Token for <strong>{created.endpoint.name}</strong> rotated. The old token no longer works.</>
+              : <>Endpoint <strong>{created.endpoint.name}</strong> created.</>}{' '}
+            This token is shown once. Use it as the DoT SNI label
+            (<code>&lt;token&gt;.your.domain</code>) or in the DoH path
+            (<code>/dns-query/&lt;token&gt;</code>):
           </p>
           <code className="block">{created.token}</code>
           <button className="link" onClick={() => setCreated(null)}>dismiss</button>

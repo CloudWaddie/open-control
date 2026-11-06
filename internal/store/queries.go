@@ -40,8 +40,14 @@ func SeedDefaults(db DBTX) error {
 	}
 	profileID, _ := res.LastInsertId()
 
-	_, err = db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, name, allowed_source_ips) VALUES (?, ?, 'default', 'default', '["0.0.0.0/0"]')`,
-		orgID, profileID)
+	// The seeded endpoint gets an unknown random token: it is reached by source
+	// IP, and nobody holds a token for it. Rotate to issue one.
+	secret, err := NewSecret()
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, name, allowed_source_ips) VALUES (?, ?, ?, 'default', '["0.0.0.0/0"]')`,
+		orgID, profileID, HashToken(secret))
 	if err != nil {
 		return err
 	}
@@ -192,14 +198,14 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 
 	// Endpoints (with source allowlists).
 	var eps []*policy.Endpoint
-	rows, err = db.Query(`SELECT id, name, profile_id, allowed_source_ips FROM endpoints`)
+	rows, err = db.Query(`SELECT id, name, profile_id, allowed_source_ips, token FROM endpoints`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var e policy.Endpoint
 		var allowed string
-		if err := rows.Scan(&e.ID, &e.Name, &e.ProfileID, &allowed); err != nil {
+		if err := rows.Scan(&e.ID, &e.Name, &e.ProfileID, &allowed, &e.TokenHash); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -286,9 +292,10 @@ func AddEndpoint(db DBTX, org int64, name string, profileID int64, cidrs string)
 		return 0, "", err
 	}
 	token := hex.EncodeToString(buf)
+	// Only the hash is stored; the plaintext is returned once to the caller.
 	res, err := db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, name, allowed_source_ips)
 		SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM profiles WHERE id = ? AND org_id = ?)`,
-		org, profileID, token, name, string(raw), profileID, org)
+		org, profileID, HashToken(token), name, string(raw), profileID, org)
 	if err != nil {
 		return 0, "", err
 	}

@@ -1,12 +1,28 @@
 // Package resolver wires miekg/dns into the Open Control serving path:
-// UDP/TCP listeners, cache, upstream pool, policy hook.
+// UDP/TCP/DoT/DoH listeners, cache, upstream pool, policy hook.
+//
+// Every transport calls answer(), so the policy decision is identical for all
+// of them. Only the way the client's identity is read differs:
+//
+//	UDP, TCP   → source IP (matched against endpoint CIDRs)
+//	DoT        → token in the TLS SNI's first label (e.g. <token>.dns.example.com)
+//	DoH        → token in the path (/dns-query/<token>)
+//
+// A presented token that matches no endpoint is refused. It never falls back to
+// the IP-based or default policy.
 package resolver
 
 import (
+	"crypto/tls"
+	"encoding/base64"
+	"errors"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/netip"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -46,76 +62,61 @@ func New(cfg *config.Config) *Resolver {
 	}
 }
 
-// ListenAndServe starts UDP and TCP servers on cfg.Listen and blocks until one
-// of them fails exactly once.
-func (r *Resolver) ListenAndServe() error {
-	errc := make(chan error, 2)
-
-	mux := dns.NewServeMux()
-	mux.HandleFunc(".", r.handle)
-
-	udpServer := &dns.Server{Addr: r.cfg.Listen, Net: "udp", Handler: mux, UDPSize: 4096}
-	tcpServer := &dns.Server{Addr: r.cfg.Listen, Net: "tcp", Handler: mux}
-
-	go func() {
-		log.Printf("resolver: UDP listening on %s", r.cfg.Listen)
-		errc <- udpServer.ListenAndServe()
-	}()
-	go func() {
-		log.Printf("resolver: TCP listening on %s", r.cfg.Listen)
-		errc <- tcpServer.ListenAndServe()
-	}()
-
-	// Block on whichever server exits first with an error.
-	return <-errc
+// client describes who is asking. token is set by DoT (SNI) or DoH (path) and
+// takes precedence over the source address.
+type client struct {
+	addr  string // remote host:port, for logs and CIDR matching
+	token string
 }
 
-// Handle is the M0 hot path. Structured so each step maps to a plan phase:
-//
-//	identify endpoint (M1) -> evaluate policy (M1) -> cache (M0) -> upstream (M0)
-func (r *Resolver) handle(w dns.ResponseWriter, req *dns.Msg) {
-	clientAddr := "unknown"
-	if addr := w.RemoteAddr(); addr != nil {
-		clientAddr = addr.String()
-	}
-
+// answer decides and produces the reply for one query. It never returns nil,
+// and a panic inside becomes SERVFAIL rather than a silent drop.
+func (r *Resolver) answer(req *dns.Msg, c client) (resp *dns.Msg) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			log.Printf("resolver: panic from client %s: %v\n%s", clientAddr, rec, debug.Stack())
+			log.Printf("resolver: panic from client %s: %v\n%s", c.addr, rec, debug.Stack())
+			resp = refusal(req, dns.RcodeServerFailure)
 		}
 	}()
 
-	if req.Opcode != dns.OpcodeQuery || len(req.Question) != 1 {
-		_ = w.WriteMsg(refusal(req, dns.RcodeNotImplemented))
-		return
+	if req == nil || req.Opcode != dns.OpcodeQuery || len(req.Question) != 1 {
+		return refusal(req, dns.RcodeNotImplemented)
 	}
 	q := req.Question[0]
-	clientIP := clientIP(clientAddr)
 	key := cache.MakeKey(req)
 
-	// Policy evaluation (M1): endpoint → profile → decision (PLAN.md §1).
-	snap := r.snapshot.Load()
-	if snap != nil {
+	// Policy (M1/M3): identify the endpoint → profile → decision.
+	if snap := r.snapshot.Load(); snap != nil {
 		var prof *policy.Profile
-		if ep := snap.EndpointForClientIP(clientIP); ep != nil {
+		if c.token != "" {
+			ep := snap.EndpointForToken(c.token)
+			if ep == nil {
+				log.Printf("resolver: REFUSED %s — unknown endpoint token via %s", q.Name, c.addr)
+				return refusal(req, dns.RcodeRefused)
+			}
 			prof = snap.ProfileForEndpoint(ep.ProfileID)
-		}
-		if prof == nil {
-			// No endpoint match: fall back to the default org's first profile
-			// so a local query never escapes filtering.
-			prof = snap.DefaultProfile()
+			if prof == nil {
+				return refusal(req, dns.RcodeRefused)
+			}
+		} else {
+			if ep := snap.EndpointForClientIP(clientIP(c.addr)); ep != nil {
+				prof = snap.ProfileForEndpoint(ep.ProfileID)
+			}
+			if prof == nil {
+				// No endpoint match: fall back to the default org's first profile
+				// so a local query never escapes filtering.
+				prof = snap.DefaultProfile()
+			}
 		}
 		if prof != nil {
 			d := snap.Evaluate(prof, q.Name)
 			switch d.Action {
 			case policy.ActionBlock:
-				log.Printf("resolver: BLOCK %s (%s) via %s", q.Name, d.Reason, clientAddr)
-				_ = w.WriteMsg(refusal(req, dns.RcodeNameError))
-				return
+				log.Printf("resolver: BLOCK %s (%s) via %s", q.Name, d.Reason, c.addr)
+				return refusal(req, dns.RcodeNameError)
 			case policy.ActionRewrite:
-				log.Printf("resolver: REWRITE %s -> %s via %s", q.Name, d.Target, clientAddr)
-				_ = w.WriteMsg(rewriteReply(req, q, d.Target))
-				return
+				log.Printf("resolver: REWRITE %s -> %s via %s", q.Name, d.Target, c.addr)
+				return rewriteReply(req, q, d.Target)
 			case policy.ActionRedirect:
 				// Egress phase (PLAN.md M5): forward until exits exist.
 				log.Printf("resolver: REDIRECT %s stubbed (%s), forwarding", q.Name, d.Reason)
@@ -125,29 +126,171 @@ func (r *Resolver) handle(w dns.ResponseWriter, req *dns.Msg) {
 
 	// Cache: serve the response if we still have it.
 	if msg := r.cache.Get(key, req.Id); msg != nil {
-		_ = w.WriteMsg(msg)
-		return
+		return msg
 	}
 
-	// Single in-flight upstream fetch per key, per PLAN.md M0 (recovery).
+	// Single in-flight upstream fetch per key (PLAN.md M0, recovery).
 	v, _, _ := r.sf.Do(key, func() (any, error) {
 		return r.forward(&q), nil
 	})
-	resp, _ := v.(*dns.Msg)
-	if resp == nil {
-		_ = w.WriteMsg(refusal(req, dns.RcodeServerFailure))
-		return
+	up, _ := v.(*dns.Msg)
+	if up == nil {
+		return refusal(req, dns.RcodeServerFailure)
 	}
 
-	// We got the upstream answer; cache it (TTL already clamped by forward)
-	// and serve.
-	ttl := minTTL(resp)
-	if ttl > 0 {
-		r.cache.Put(key, resp, ttl)
+	// Cache the upstream answer (TTL already clamped by forward) and serve it.
+	if ttl := minTTL(up); ttl > 0 {
+		r.cache.Put(key, up, ttl)
 	}
-	out := resp.Copy()
+	out := up.Copy()
 	out.Id = req.Id
-	_ = w.WriteMsg(out)
+	return out
+}
+
+// handle serves UDP, TCP and DoT (miekg/dns handler).
+func (r *Resolver) handle(w dns.ResponseWriter, req *dns.Msg) {
+	c := client{addr: remoteAddr(w), token: tokenFromSNI(w)}
+	_ = w.WriteMsg(r.answer(req, c))
+}
+
+// ListenAndServe starts every configured listener and blocks until one fails.
+func (r *Resolver) ListenAndServe() error {
+	var tlsCfg *tls.Config
+	if r.cfg.DoTListen != "" || r.cfg.DoHListen != "" {
+		if r.cfg.TLSCert == "" || r.cfg.TLSKey == "" {
+			return errors.New("DoT/DoH need tls_cert and tls_key")
+		}
+		cert, err := tls.LoadX509KeyPair(r.cfg.TLSCert, r.cfg.TLSKey)
+		if err != nil {
+			return err
+		}
+		tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	}
+
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", r.handle)
+
+	errc := make(chan error, 4)
+	start := func(name, addr string, f func() error) {
+		log.Printf("resolver: %s listening on %s", name, addr)
+		go func() { errc <- f() }()
+	}
+
+	udp := &dns.Server{Addr: r.cfg.Listen, Net: "udp", Handler: mux, UDPSize: 4096}
+	tcp := &dns.Server{Addr: r.cfg.Listen, Net: "tcp", Handler: mux}
+	start("UDP", r.cfg.Listen, udp.ListenAndServe)
+	start("TCP", r.cfg.Listen, tcp.ListenAndServe)
+
+	if r.cfg.DoTListen != "" {
+		dot := &dns.Server{Addr: r.cfg.DoTListen, Net: "tcp-tls", TLSConfig: tlsCfg, Handler: mux}
+		start("DoT", r.cfg.DoTListen, dot.ListenAndServe)
+	}
+	if r.cfg.DoHListen != "" {
+		hm := http.NewServeMux()
+		hm.Handle("/dns-query", r.dohHandler())
+		hm.Handle("/dns-query/", r.dohHandler())
+		doh := &http.Server{Addr: r.cfg.DoHListen, Handler: hm, TLSConfig: tlsCfg, ReadHeaderTimeout: 10 * time.Second}
+		start("DoH", r.cfg.DoHListen, func() error { return doh.ListenAndServeTLS("", "") })
+	}
+
+	// The first listener to fail stops the process; the caller exits.
+	return <-errc
+}
+
+// dohHandler implements RFC 8484 GET and POST. The endpoint token, if any, is
+// the single path segment after /dns-query.
+func (r *Resolver) dohHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, hr *http.Request) {
+		rest := strings.TrimPrefix(hr.URL.Path, "/dns-query")
+		rest = strings.TrimPrefix(rest, "/")
+		if strings.Contains(rest, "/") {
+			http.NotFound(w, hr)
+			return
+		}
+
+		req, err := readDoHQuery(w, hr)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp := r.answer(req, client{addr: hr.RemoteAddr, token: rest})
+		packed, err := resp.Pack()
+		if err != nil {
+			http.Error(w, "pack failed", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		w.Header().Set("Content-Length", strconv.Itoa(len(packed)))
+		_, _ = w.Write(packed)
+	})
+}
+
+// readDoHQuery decodes the DNS message from a GET (?dns=base64url) or POST
+// (application/dns-message body) request.
+func readDoHQuery(w http.ResponseWriter, hr *http.Request) (*dns.Msg, error) {
+	var wire []byte
+	switch hr.Method {
+	case http.MethodGet:
+		enc := strings.TrimRight(hr.URL.Query().Get("dns"), "=")
+		if enc == "" {
+			return nil, errors.New("missing dns parameter")
+		}
+		b, err := base64.RawURLEncoding.DecodeString(enc)
+		if err != nil {
+			return nil, errors.New("dns parameter is not base64url")
+		}
+		wire = b
+	case http.MethodPost:
+		if hr.Header.Get("Content-Type") != "application/dns-message" {
+			return nil, errors.New("content type must be application/dns-message")
+		}
+		b, err := io.ReadAll(http.MaxBytesReader(w, hr.Body, 4096))
+		if err != nil {
+			return nil, errors.New("body too large or unreadable")
+		}
+		wire = b
+	default:
+		return nil, errors.New("method must be GET or POST")
+	}
+	req := new(dns.Msg)
+	if err := req.Unpack(wire); err != nil {
+		return nil, errors.New("not a DNS message")
+	}
+	return req, nil
+}
+
+// tokenFromSNI reads the endpoint token from a DoT connection's SNI. Only a
+// first label with the token shape counts; any other SNI means "no token".
+func tokenFromSNI(w dns.ResponseWriter) string {
+	cs, ok := w.(dns.ConnectionStater)
+	if !ok {
+		return ""
+	}
+	st := cs.ConnectionState()
+	if st == nil {
+		return ""
+	}
+	label, _, _ := strings.Cut(strings.ToLower(st.ServerName), ".")
+	if len(label) == 32 && isHex(label) {
+		return label
+	}
+	return ""
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func remoteAddr(w dns.ResponseWriter) string {
+	if addr := w.RemoteAddr(); addr != nil {
+		return addr.String()
+	}
+	return "unknown"
 }
 
 // forward sends the question to the next upstream, UDP first with TCP fallback
@@ -209,7 +352,9 @@ func minTTL(msg *dns.Msg) time.Duration {
 // refusal builds a same-shape error reply for a request.
 func refusal(req *dns.Msg, code int) *dns.Msg {
 	m := new(dns.Msg)
-	m.SetReply(req)
+	if req != nil {
+		m.SetReply(req)
+	}
 	m.Rcode = code
 	return m
 }
@@ -248,3 +393,4 @@ func rewriteReply(req *dns.Msg, q dns.Question, target string) *dns.Msg {
 	}
 	return resp
 }
+

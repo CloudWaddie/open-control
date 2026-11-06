@@ -327,6 +327,31 @@ func (f *fixture) tokenID(t *testing.T, name string) int64 {
 	return id
 }
 
+func TestRotateEndpointToken(t *testing.T) {
+	f := newFixture(t)
+	code, body, raw := f.do("POST", "/api/v1/endpoints", f.operator,
+		`{"name":"phone","profile_id":1,"cidrs":["10.0.0.0/8"]}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create: %d %s", code, raw)
+	}
+	id := itoa(int64(body["endpoint"].(map[string]any)["id"].(float64)))
+	old := body["token"].(string)
+
+	if code, _, _ := f.do("POST", "/api/v1/endpoints/"+id+"/rotate", f.viewer, ""); code != http.StatusForbidden {
+		t.Errorf("viewer rotate: %d, want 403", code)
+	}
+	if code, _, _ := f.do("POST", "/api/v1/endpoints/"+id+"/rotate", f.otherAdmin, ""); code != http.StatusNotFound {
+		t.Errorf("other tenant rotate: %d, want 404", code)
+	}
+	code, rot, raw := f.do("POST", "/api/v1/endpoints/"+id+"/rotate", f.operator, "")
+	if code != http.StatusOK || rot["token"] == nil || rot["token"] == old {
+		t.Fatalf("rotate: %d %s", code, raw)
+	}
+	if strings.Contains(string(raw), "token_hash") {
+		t.Error("rotation response exposes the stored hash")
+	}
+}
+
 func TestWhoami(t *testing.T) {
 	f := newFixture(t)
 	code, body, _ := f.do("GET", "/api/v1/whoami", f.operator, "")

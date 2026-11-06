@@ -64,6 +64,7 @@ func Handler(db *sql.DB, reload func()) http.Handler {
 	mux.Handle("GET /api/v1/endpoints", s.require("viewer", s.listEndpoints))
 	mux.Handle("POST /api/v1/endpoints", s.require("operator", s.createEndpoint))
 	mux.Handle("DELETE /api/v1/endpoints/{id}", s.require("operator", s.deleteEndpoint))
+	mux.Handle("POST /api/v1/endpoints/{id}/rotate", s.require("operator", s.rotateEndpoint))
 
 	mux.Handle("GET /api/v1/blocklists", s.require("viewer", s.listBlocklists))
 	mux.Handle("POST /api/v1/blocklists", s.require("operator", s.createBlocklist))
@@ -292,6 +293,26 @@ func (s *Server) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 			return result{}, err
 		}
 		return result{target: "endpoint " + strconv.FormatInt(id, 10), status: http.StatusNoContent}, nil
+	})
+}
+
+// rotateEndpoint issues a new endpoint token. The old one stops working at once.
+func (s *Server) rotateEndpoint(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	s.mutate(w, r, "endpoint.rotate", func(tx *sql.Tx, org int64) (result, error) {
+		token, err := store.RotateEndpointToken(tx, org, id)
+		if err != nil {
+			return result{}, err
+		}
+		// Shown exactly once: only its hash is stored.
+		return result{
+			target: "endpoint " + strconv.FormatInt(id, 10),
+			status: http.StatusOK,
+			body:   map[string]any{"id": id, "token": token},
+		}, nil
 	})
 }
 

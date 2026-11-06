@@ -2,13 +2,14 @@ package store
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/cloudwaddie/opencontrol/internal/policy"
 )
 
 // api.go — org-scoped data access for the control-plane REST API (PLAN.md M2).
@@ -190,8 +191,31 @@ func InsertAudit(db DBTX, org int64, actor, action, target string) error {
 // HashToken is the storage form of an API token. Tokens are high-entropy
 // random strings, so a fast hash is appropriate; the plaintext is never stored.
 func HashToken(plain string) string {
-	sum := sha256.Sum256([]byte(plain))
-	return hex.EncodeToString(sum[:])
+	return policy.HashSecret(plain)
+}
+
+// NewSecret returns a random 128-bit hex string for endpoint tokens.
+func NewSecret() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// RotateEndpointToken replaces an endpoint's token. The old token stops working
+// immediately; the new plaintext is returned once.
+func RotateEndpointToken(db DBTX, org, id int64) (string, error) {
+	token, err := NewSecret()
+	if err != nil {
+		return "", err
+	}
+	// deleteRow reports ErrNotFound when no row matched (wrong id or org).
+	if err := deleteRow(db, `UPDATE endpoints SET token = ? WHERE id = ? AND org_id = ?`,
+		HashToken(token), id, org); err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 // CreateToken mints a random token for org with a role. The plaintext is
