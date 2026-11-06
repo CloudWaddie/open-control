@@ -53,7 +53,45 @@ type AuditEntry struct {
 // ErrNotFound is returned when a delete targets a missing row.
 var ErrNotFound = errors.New("not found")
 
-func ListProfiles(db *sql.DB) ([]Profile, error) {
+// DBTX is satisfied by *sql.DB and *sql.Tx. Mutations take a DBTX so a change
+// and its audit row can commit or roll back together.
+type DBTX interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+type Token struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ListTokens returns token metadata. Hashes are never returned.
+func ListTokens(db DBTX) ([]Token, error) {
+	rows, err := db.Query(`SELECT id, name, role, created_at FROM api_tokens ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Token{}
+	for rows.Next() {
+		var t Token
+		if err := rows.Scan(&t.ID, &t.Name, &t.Role, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// RevokeToken deletes a token; its bearer is refused from the next request on.
+func RevokeToken(db DBTX, id int64) error {
+	return deleteRow(db, `DELETE FROM api_tokens WHERE id = ?`, id)
+}
+
+func ListProfiles(db DBTX) ([]Profile, error) {
 	rows, err := db.Query(`SELECT id, name FROM profiles ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -70,7 +108,7 @@ func ListProfiles(db *sql.DB) ([]Profile, error) {
 	return out, rows.Err()
 }
 
-func ListRules(db *sql.DB, profileID int64) ([]Rule, error) {
+func ListRules(db DBTX, profileID int64) ([]Rule, error) {
 	rows, err := db.Query(`SELECT id, profile_id, kind, matcher, pattern, answer FROM profile_rules WHERE profile_id = ? ORDER BY id`, profileID)
 	if err != nil {
 		return nil, err
@@ -87,11 +125,11 @@ func ListRules(db *sql.DB, profileID int64) ([]Rule, error) {
 	return out, rows.Err()
 }
 
-func DeleteRule(db *sql.DB, id int64) error {
+func DeleteRule(db DBTX, id int64) error {
 	return deleteRow(db, `DELETE FROM profile_rules WHERE id = ?`, id)
 }
 
-func ListEndpoints(db *sql.DB) ([]Endpoint, error) {
+func ListEndpoints(db DBTX) ([]Endpoint, error) {
 	rows, err := db.Query(`SELECT id, profile_id, name, allowed_source_ips FROM endpoints ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -110,11 +148,11 @@ func ListEndpoints(db *sql.DB) ([]Endpoint, error) {
 	return out, rows.Err()
 }
 
-func DeleteEndpoint(db *sql.DB, id int64) error {
+func DeleteEndpoint(db DBTX, id int64) error {
 	return deleteRow(db, `DELETE FROM endpoints WHERE id = ?`, id)
 }
 
-func ListBlocklists(db *sql.DB) ([]Blocklist, error) {
+func ListBlocklists(db DBTX) ([]Blocklist, error) {
 	rows, err := db.Query(`SELECT id, url, format, COALESCE(last_synced, '') FROM blocklist_sources ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -131,12 +169,12 @@ func ListBlocklists(db *sql.DB) ([]Blocklist, error) {
 	return out, rows.Err()
 }
 
-func DeleteBlocklist(db *sql.DB, id int64) error {
+func DeleteBlocklist(db DBTX, id int64) error {
 	return deleteRow(db, `DELETE FROM blocklist_sources WHERE id = ?`, id)
 }
 
 // ListAudit returns the newest audit entries first.
-func ListAudit(db *sql.DB, limit int) ([]AuditEntry, error) {
+func ListAudit(db DBTX, limit int) ([]AuditEntry, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
@@ -157,7 +195,7 @@ func ListAudit(db *sql.DB, limit int) ([]AuditEntry, error) {
 }
 
 // InsertAudit records an admin action. Every mutating API call writes one.
-func InsertAudit(db *sql.DB, actor, action, target string) error {
+func InsertAudit(db DBTX, actor, action, target string) error {
 	orgID, err := DefaultOrgID(db)
 	if err != nil {
 		return err
@@ -176,7 +214,7 @@ func HashToken(plain string) string {
 
 // CreateToken mints a random API token with a role. The plaintext is returned
 // once and cannot be recovered afterwards.
-func CreateToken(db *sql.DB, name, role string) (string, error) {
+func CreateToken(db DBTX, name, role string) (string, error) {
 	switch role {
 	case "admin", "operator", "viewer":
 	default:
@@ -199,18 +237,20 @@ func CreateToken(db *sql.DB, name, role string) (string, error) {
 }
 
 // LookupToken resolves a presented token to its name and role.
-func LookupToken(db *sql.DB, plain string) (name, role string, ok bool, err error) {
-	err = db.QueryRow(`SELECT name, role FROM api_tokens WHERE token_hash = ?`, HashToken(plain)).Scan(&name, &role)
+func LookupToken(db DBTX, plain string) (Token, bool, error) {
+	var t Token
+	err := db.QueryRow(`SELECT id, name, role, created_at FROM api_tokens WHERE token_hash = ?`,
+		HashToken(plain)).Scan(&t.ID, &t.Name, &t.Role, &t.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", false, nil
+		return Token{}, false, nil
 	}
 	if err != nil {
-		return "", "", false, err
+		return Token{}, false, err
 	}
-	return name, role, true, nil
+	return t, true, nil
 }
 
-func deleteRow(db *sql.DB, query string, id int64) error {
+func deleteRow(db DBTX, query string, id int64) error {
 	res, err := db.Exec(query, id)
 	if err != nil {
 		return err

@@ -1,13 +1,21 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../api.js';
-import { ErrorLine } from '../ui.jsx';
+import { ErrorLine, Confirm } from '../ui.jsx';
 
-// Minting only: the API does not list tokens (only hashes are stored, and
-// they are not useful to show). Revocation is a planned API addition.
-export default function Tokens() {
+export default function Tokens({ me }) {
+  const [tokens, setTokens] = useState(null);
   const [form, setForm] = useState({ name: '', role: 'viewer' });
   const [minted, setMinted] = useState(null);
   const [error, setError] = useState('');
+
+  const load = () =>
+    api('GET', '/tokens')
+      .then(setTokens)
+      .catch((e) => setError(e.message));
+
+  useEffect(() => {
+    load();
+  }, []);
 
   async function mint(e) {
     e.preventDefault();
@@ -15,6 +23,17 @@ export default function Tokens() {
     try {
       setMinted(await api('POST', '/tokens', form));
       setForm({ ...form, name: '' });
+      load();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function revoke(id) {
+    setError('');
+    try {
+      await api('DELETE', `/tokens/${id}`);
+      load();
     } catch (err) {
       setError(err.message);
     }
@@ -23,8 +42,46 @@ export default function Tokens() {
   return (
     <div className="stack">
       <section className="card">
-        <h2>Mint an API token</h2>
+        <h2>API tokens</h2>
+        <p className="muted">
+          Revoking a token takes effect on its next request. You cannot revoke the
+          token you are signed in with.
+        </p>
         <ErrorLine error={error} />
+        {!tokens ? (
+          <p className="muted">Loading…</p>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Role</th>
+                <th>Created</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {tokens.map((t) => (
+                <tr key={t.id}>
+                  <td>
+                    {t.name} {t.name === me.name && <span className="muted">(you)</span>}
+                  </td>
+                  <td><span className="pill">{t.role}</span></td>
+                  <td>{t.created_at}</td>
+                  <td>
+                    {t.name !== me.name && (
+                      <Confirm label="revoke" onConfirm={() => revoke(t.id)} />
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>Mint a token</h2>
         <form className="grid" onSubmit={mint}>
           <input
             placeholder="name, e.g. grafana-dashboard"

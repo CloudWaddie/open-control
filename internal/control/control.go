@@ -5,7 +5,10 @@
 //
 //	viewer   — read everything
 //	operator — viewer + change profiles, rules, endpoints, blocklists
-//	admin    — operator + mint tokens, read the audit log
+//	admin    — operator + mint and revoke tokens, read the audit log
+//
+// Every write runs in one transaction together with its audit row, so a change
+// and its record commit or roll back as a unit. The resolver reloads after commit.
 package control
 
 import (
@@ -24,6 +27,7 @@ import (
 )
 
 type principal struct {
+	id   int64
 	name string
 	role string
 }
@@ -38,8 +42,8 @@ type Server struct {
 	reload func() // asks the resolver to recompile its snapshot
 }
 
-// Handler returns the API mux. reload is called after every successful write
-// so changes take effect without a restart.
+// Handler returns the API mux plus the embedded UI. reload is called after
+// every committed write so changes take effect without a restart.
 func Handler(db *sql.DB, reload func()) http.Handler {
 	s := &Server{db: db, reload: reload}
 	mux := http.NewServeMux()
@@ -47,7 +51,6 @@ func Handler(db *sql.DB, reload func()) http.Handler {
 	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-
 	mux.Handle("GET /api/v1/whoami", s.require("viewer", s.whoami))
 
 	mux.Handle("GET /api/v1/profiles", s.require("viewer", s.listProfiles))
@@ -65,18 +68,14 @@ func Handler(db *sql.DB, reload func()) http.Handler {
 	mux.Handle("DELETE /api/v1/blocklists/{id}", s.require("operator", s.deleteBlocklist))
 
 	mux.Handle("GET /api/v1/audit", s.require("admin", s.listAudit))
+	mux.Handle("GET /api/v1/tokens", s.require("admin", s.listTokens))
 	mux.Handle("POST /api/v1/tokens", s.require("admin", s.createToken))
+	mux.Handle("DELETE /api/v1/tokens/{id}", s.require("admin", s.revokeToken))
 
 	// Everything else is the web UI (see internal/web).
 	mux.Handle("/", web.Handler())
 
 	return mux
-}
-
-// whoami lets the UI learn who and what role the presented token has.
-func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
-	p, _ := r.Context().Value(ctxKey{}).(principal)
-	writeJSON(w, http.StatusOK, map[string]string{"name": p.name, "role": p.role})
 }
 
 // require authenticates the bearer token and enforces a minimum role.
@@ -87,7 +86,7 @@ func (s *Server) require(minRole string, h http.HandlerFunc) http.Handler {
 			writeErr(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
-		name, role, found, err := store.LookupToken(s.db, plain)
+		p, found, err := store.LookupToken(s.db, plain)
 		if err != nil {
 			log.Printf("control: token lookup: %v", err)
 			writeErr(w, http.StatusInternalServerError, "auth unavailable")
@@ -97,11 +96,12 @@ func (s *Server) require(minRole string, h http.HandlerFunc) http.Handler {
 			writeErr(w, http.StatusUnauthorized, "invalid token")
 			return
 		}
-		if roleRank[role] < roleRank[minRole] {
-			writeErr(w, http.StatusForbidden, "role "+role+" cannot perform this action (needs "+minRole+")")
+		if roleRank[p.Role] < roleRank[minRole] {
+			writeErr(w, http.StatusForbidden, "role "+p.Role+" cannot perform this action (needs "+minRole+")")
 			return
 		}
-		h(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, principal{name, role})))
+		pr := principal{id: p.ID, name: p.Name, role: p.Role}
+		h(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, pr)))
 	})
 }
 
@@ -112,14 +112,58 @@ func actor(r *http.Request) string {
 	return ""
 }
 
-// mutated runs after a successful write: audit it and reload the resolver.
-func (s *Server) mutated(r *http.Request, action, target string) {
-	if err := store.InsertAudit(s.db, actor(r), action, target); err != nil {
-		log.Printf("control: audit write failed for %s %s: %v", action, target, err)
+// result is what a successful mutation returns to the client.
+type result struct {
+	target string // audit target
+	status int
+	body   any // nil for 204
+}
+
+// mutate runs fn inside a transaction, records the audit row in the same
+// transaction, commits, and only then reloads the resolver. Errors from fn map
+// to 404 when the row is missing and 400 otherwise (input problems).
+func (s *Server) mutate(w http.ResponseWriter, r *http.Request, action string, fn func(tx *sql.Tx) (result, error)) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := fn(tx)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := store.InsertAudit(tx, actor(r), action, res.target); err != nil {
+		log.Printf("control: audit insert failed, change rolled back: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("control: commit failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal error")
+		return
 	}
 	if s.reload != nil {
 		go s.reload()
 	}
+	if res.body == nil {
+		w.WriteHeader(res.status)
+		return
+	}
+	writeJSON(w, res.status, res.body)
+}
+
+// --- identity ---
+
+func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
+	p, _ := r.Context().Value(ctxKey{}).(principal)
+	writeJSON(w, http.StatusOK, map[string]string{"name": p.name, "role": p.role})
 }
 
 // --- profiles ---
@@ -140,13 +184,13 @@ func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	id, err := store.AddProfile(s.db, in.Name)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	s.mutated(r, "profile.create", in.Name)
-	writeJSON(w, http.StatusCreated, store.Profile{ID: id, Name: in.Name})
+	s.mutate(w, r, "profile.create", func(tx *sql.Tx) (result, error) {
+		id, err := store.AddProfile(tx, in.Name)
+		if err != nil {
+			return result{}, err
+		}
+		return result{target: in.Name, status: http.StatusCreated, body: store.Profile{ID: id, Name: in.Name}}, nil
+	})
 }
 
 // --- rules ---
@@ -174,15 +218,19 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	id, err := store.AddRule(s.db, profileID, in.Kind, in.Matcher, in.Pattern, in.Answer)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	s.mutated(r, "rule.create", in.Kind+" "+in.Matcher+" "+in.Pattern)
-	writeJSON(w, http.StatusCreated, store.Rule{
-		ID: id, ProfileID: profileID, Kind: in.Kind, Matcher: in.Matcher,
-		Pattern: in.Pattern, Answer: in.Answer,
+	s.mutate(w, r, "rule.create", func(tx *sql.Tx) (result, error) {
+		id, err := store.AddRule(tx, profileID, in.Kind, in.Matcher, in.Pattern, in.Answer)
+		if err != nil {
+			return result{}, err
+		}
+		return result{
+			target: in.Kind + " " + in.Matcher + " " + in.Pattern,
+			status: http.StatusCreated,
+			body: store.Rule{
+				ID: id, ProfileID: profileID, Kind: in.Kind, Matcher: in.Matcher,
+				Pattern: in.Pattern, Answer: in.Answer,
+			},
+		}, nil
 	})
 }
 
@@ -191,7 +239,12 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.deleteOne(w, r, "rule.delete", "rule", id, store.DeleteRule)
+	s.mutate(w, r, "rule.delete", func(tx *sql.Tx) (result, error) {
+		if err := store.DeleteRule(tx, id); err != nil {
+			return result{}, err
+		}
+		return result{target: "rule " + strconv.FormatInt(id, 10), status: http.StatusNoContent}, nil
+	})
 }
 
 // --- endpoints ---
@@ -212,15 +265,19 @@ func (s *Server) createEndpoint(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	id, token, err := store.AddEndpoint(s.db, in.Name, in.ProfileID, strings.Join(in.CIDRs, ","))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	s.mutated(r, "endpoint.create", in.Name)
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"endpoint": store.Endpoint{ID: id, ProfileID: in.ProfileID, Name: in.Name, CIDRs: in.CIDRs},
-		"token":    token,
+	s.mutate(w, r, "endpoint.create", func(tx *sql.Tx) (result, error) {
+		id, token, err := store.AddEndpoint(tx, in.Name, in.ProfileID, strings.Join(in.CIDRs, ","))
+		if err != nil {
+			return result{}, err
+		}
+		return result{
+			target: in.Name,
+			status: http.StatusCreated,
+			body: map[string]any{
+				"endpoint": store.Endpoint{ID: id, ProfileID: in.ProfileID, Name: in.Name, CIDRs: in.CIDRs},
+				"token":    token,
+			},
+		}, nil
 	})
 }
 
@@ -229,7 +286,12 @@ func (s *Server) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.deleteOne(w, r, "endpoint.delete", "endpoint", id, store.DeleteEndpoint)
+	s.mutate(w, r, "endpoint.delete", func(tx *sql.Tx) (result, error) {
+		if err := store.DeleteEndpoint(tx, id); err != nil {
+			return result{}, err
+		}
+		return result{target: "endpoint " + strconv.FormatInt(id, 10), status: http.StatusNoContent}, nil
+	})
 }
 
 // --- blocklists ---
@@ -254,12 +316,12 @@ func (s *Server) createBlocklist(w http.ResponseWriter, r *http.Request) {
 	if in.Format == "" {
 		in.Format = "hosts"
 	}
-	if err := store.AddBlocklistSource(s.db, in.URL, in.Format); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	s.mutated(r, "blocklist.create", in.URL)
-	writeJSON(w, http.StatusCreated, map[string]string{"url": in.URL, "format": in.Format})
+	s.mutate(w, r, "blocklist.create", func(tx *sql.Tx) (result, error) {
+		if err := store.AddBlocklistSource(tx, in.URL, in.Format); err != nil {
+			return result{}, err
+		}
+		return result{target: in.URL, status: http.StatusCreated, body: map[string]string{"url": in.URL, "format": in.Format}}, nil
+	})
 }
 
 func (s *Server) deleteBlocklist(w http.ResponseWriter, r *http.Request) {
@@ -267,7 +329,12 @@ func (s *Server) deleteBlocklist(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.deleteOne(w, r, "blocklist.delete", "blocklist", id, store.DeleteBlocklist)
+	s.mutate(w, r, "blocklist.delete", func(tx *sql.Tx) (result, error) {
+		if err := store.DeleteBlocklist(tx, id); err != nil {
+			return result{}, err
+		}
+		return result{target: "blocklist " + strconv.FormatInt(id, 10), status: http.StatusNoContent}, nil
+	})
 }
 
 // --- admin ---
@@ -275,6 +342,11 @@ func (s *Server) deleteBlocklist(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	out, err := store.ListAudit(s.db, limit)
+	respond(w, out, err)
+}
+
+func (s *Server) listTokens(w http.ResponseWriter, r *http.Request) {
+	out, err := store.ListTokens(s.db)
 	respond(w, out, err)
 }
 
@@ -290,30 +362,40 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	plain, err := store.CreateToken(s.db, in.Name, in.Role)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+	s.mutate(w, r, "token.create", func(tx *sql.Tx) (result, error) {
+		plain, err := store.CreateToken(tx, in.Name, in.Role)
+		if err != nil {
+			return result{}, err
+		}
+		// Shown exactly once: only its hash is stored.
+		return result{
+			target: in.Name + " (" + in.Role + ")",
+			status: http.StatusCreated,
+			body:   map[string]string{"name": in.Name, "role": in.Role, "token": plain},
+		}, nil
+	})
+}
+
+func (s *Server) revokeToken(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
 		return
 	}
-	s.mutated(r, "token.create", in.Name+" ("+in.Role+")")
-	// Shown exactly once: only its hash is stored.
-	writeJSON(w, http.StatusCreated, map[string]string{"name": in.Name, "role": in.Role, "token": plain})
+	p, _ := r.Context().Value(ctxKey{}).(principal)
+	if p.id == id {
+		// Prevents an admin locking themselves out in the middle of a session.
+		writeErr(w, http.StatusConflict, "cannot revoke the token you are using")
+		return
+	}
+	s.mutate(w, r, "token.revoke", func(tx *sql.Tx) (result, error) {
+		if err := store.RevokeToken(tx, id); err != nil {
+			return result{}, err
+		}
+		return result{target: "token " + strconv.FormatInt(id, 10), status: http.StatusNoContent}, nil
+	})
 }
 
 // --- helpers ---
-
-func (s *Server) deleteOne(w http.ResponseWriter, r *http.Request, action, kind string, id int64, del func(*sql.DB, int64) error) {
-	if err := del(s.db, id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, kind+" not found")
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	s.mutated(r, action, strconv.FormatInt(id, 10))
-	w.WriteHeader(http.StatusNoContent)
-}
 
 func bearer(r *http.Request) (string, bool) {
 	h := r.Header.Get("Authorization")

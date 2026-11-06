@@ -185,6 +185,60 @@ func TestEndpointCreateReturnsToken(t *testing.T) {
 	}
 }
 
+// A change must not survive without its audit row: if the audit insert fails,
+// the rule write rolls back too.
+func TestWriteRollsBackWhenAuditFails(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.db.Exec(`DROP TABLE audit_logs`); err != nil {
+		t.Fatal(err)
+	}
+	code, _, raw := f.do("POST", "/api/v1/profiles/1/rules", f.operator,
+		`{"kind":"block","matcher":"domain","pattern":"ghost.example"}`)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when audit fails, got %d (%s)", code, raw)
+	}
+	var n int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM profile_rules WHERE pattern = 'ghost.example'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("rule was committed without its audit row")
+	}
+}
+
+func TestTokenRevocation(t *testing.T) {
+	f := newFixture(t)
+	// A viewer token can be revoked by an admin; then it is refused.
+	code, _, raw := f.do("GET", "/api/v1/tokens", f.admin, "")
+	if code != 200 {
+		t.Fatalf("list tokens: %d", code)
+	}
+	if strings.Contains(string(raw), "token_hash") {
+		t.Error("token listing must not expose hashes")
+	}
+	var viewerID int64
+	if err := f.db.QueryRow(`SELECT id FROM api_tokens WHERE name = 'dash'`).Scan(&viewerID); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := f.do("DELETE", "/api/v1/tokens/"+itoa(viewerID), f.admin, ""); code != http.StatusNoContent {
+		t.Fatalf("revoke: %d", code)
+	}
+	if code, _, _ := f.do("GET", "/api/v1/profiles", f.viewer, ""); code != http.StatusUnauthorized {
+		t.Errorf("revoked token still accepted: %d", code)
+	}
+}
+
+func TestCannotRevokeOwnToken(t *testing.T) {
+	f := newFixture(t)
+	var adminID int64
+	if err := f.db.QueryRow(`SELECT id FROM api_tokens WHERE name = 'root'`).Scan(&adminID); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := f.do("DELETE", "/api/v1/tokens/"+itoa(adminID), f.admin, ""); code != http.StatusConflict {
+		t.Errorf("self-revoke: got %d, want 409", code)
+	}
+}
+
 func TestWhoami(t *testing.T) {
 	f := newFixture(t)
 	code, body, _ := f.do("GET", "/api/v1/whoami", f.operator, "")

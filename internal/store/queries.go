@@ -2,7 +2,6 @@ package store
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,7 +16,7 @@ import (
 
 // SeedDefaults creates org/profile/endpoint rows on first run so the resolver
 // has something to enforce immediately.
-func SeedDefaults(db *sql.DB) error {
+func SeedDefaults(db DBTX) error {
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM orgs`).Scan(&n); err != nil {
 		return err
@@ -47,7 +46,7 @@ func SeedDefaults(db *sql.DB) error {
 }
 
 // DefaultOrgID returns the seeded org (first row).
-func DefaultOrgID(db *sql.DB) (int64, error) {
+func DefaultOrgID(db DBTX) (int64, error) {
 	var id int64
 	if err := db.QueryRow(`SELECT id FROM orgs ORDER BY id LIMIT 1`).Scan(&id); err != nil {
 		return 0, err
@@ -62,7 +61,7 @@ func DefaultOrgID(db *sql.DB) (int64, error) {
 //
 // fetch=false reads blocklists from the on-disk cache only (no network), so
 // startup never waits on a remote host. fetch=true refreshes them first.
-func LoadSnapshot(db *sql.DB, dataDir string, fetch bool) (*policy.Snapshot, error) {
+func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error) {
 	blDir := dataDir + "/blocklists"
 
 	// Profiles
@@ -194,7 +193,7 @@ func LoadSnapshot(db *sql.DB, dataDir string, fetch bool) (*policy.Snapshot, err
 
 // AddRule inserts a custom rule row (admin CLI for M1; M2 gets the API+UI).
 // pattern is the domain (or ".tld"); answer is only used by rewrite rules.
-func AddRule(db *sql.DB, profileID int64, kind, matcher, pattern, answer string) (int64, error) {
+func AddRule(db DBTX, profileID int64, kind, matcher, pattern, answer string) (int64, error) {
 	switch kind {
 	case "block", "allow", "rewrite", "redirect":
 	default:
@@ -223,7 +222,7 @@ func AddRule(db *sql.DB, profileID int64, kind, matcher, pattern, answer string)
 }
 
 // AddProfile creates a profile on the default org and returns its id.
-func AddProfile(db *sql.DB, name string) (int64, error) {
+func AddProfile(db DBTX, name string) (int64, error) {
 	orgID, err := DefaultOrgID(db)
 	if err != nil {
 		return 0, fmt.Errorf("no org: %w", err)
@@ -238,7 +237,7 @@ func AddProfile(db *sql.DB, name string) (int64, error) {
 // AddEndpoint creates an endpoint bound to profileID, admitting clients whose
 // source address falls in cidrs (comma-separated IPs or prefixes). Returns the
 // endpoint's id and its generated token.
-func AddEndpoint(db *sql.DB, name string, profileID int64, cidrs string) (int64, string, error) {
+func AddEndpoint(db DBTX, name string, profileID int64, cidrs string) (int64, string, error) {
 	orgID, err := DefaultOrgID(db)
 	if err != nil {
 		return 0, "", fmt.Errorf("no org: %w", err)
@@ -274,7 +273,7 @@ func AddEndpoint(db *sql.DB, name string, profileID int64, cidrs string) (int64,
 }
 
 // AddBlocklistSource registers a blocklist subscription on the default org.
-func AddBlocklistSource(db *sql.DB, url, format string) error {
+func AddBlocklistSource(db DBTX, url, format string) error {
 	orgID, err := DefaultOrgID(db)
 	if err != nil {
 		return fmt.Errorf("no org: %w", err)
