@@ -1,0 +1,25 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  # dev flow: rebuild → ./dev/opencontrol.exe serve (defaults: 127.0.0.1:1053 + data/opencontrol.db)
+  cmd = "go build -o ./dev/opencontrol.exe ./cmd/opencontrol"
+  bin = "./dev/opencontrol.exe"
+  args_bin = ["serve"]
+  include_ext = ["go", "yaml", "sql"]
+  include_dir = ["cmd", "internal"]
+  exclude_dir = ["tmp", "dev", "data"]
+  exclude_regex = ["_test.go"]
+  exclude_unchanged = true
+  delay = 1000
+  stop_on_error = true
+  log = "build-errors.log"
+
+[log]
+  time = true
+
+[misc]
+  clean_on_exit = true
+
+[screen]
+  clear_on_rebuild = true

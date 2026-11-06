@@ -1,0 +1,21 @@
+# Open Control — Coolify/docker compose deployment (M0).
+# DNS ports must be exposed natively; they cannot go through Coolify's
+# HTTP proxy/TLS termination. Stop any host-level DNS service first.
+services:
+  opencontrol:
+    build: .
+    image: opencontrol:latest
+    container_name: opencontrol
+    restart: unless-stopped
+    environment:
+      OC_LISTEN: ":53"
+      OC_SQLITE_PATH: "/data/opencontrol.db"
+      OC_DATA_DIR: "/data"
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - opencontrol-data:/data
+
+volumes:
+  opencontrol-data:

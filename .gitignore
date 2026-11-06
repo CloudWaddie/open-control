@@ -1,0 +1,19 @@
+# Build/dev artifacts
+/dev/
+/tmp/
+*.exe
+build-errors.log
+
+# Runtime state
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Environment
+.env
+
+# Editor/OS noise
+.idea/
+.vscode/
+nul
