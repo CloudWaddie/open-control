@@ -68,15 +68,25 @@ func (s *Snapshot) Summary() string {
 	return fmt.Sprintf("%d endpoint(s), %d profile(s), %d rule entries", len(s.endpoints), len(s.profiles), defaults)
 }
 
-// EndpointForClientIP finds the endpoint whose allowlist matches the client
-// source (longest-prefix order as loaded). No match → nil.
+// EndpointForClientIP returns the endpoint whose source allowlist matches the
+// client with the most specific (longest) prefix, so a /32 endpoint beats a
+// broad /0 one regardless of load order. No match → nil.
 func (s *Snapshot) EndpointForClientIP(ip netip.Addr) *Endpoint {
+	var best *Endpoint
+	bestBits := -1
 	for _, e := range s.endpoints {
-		if e.Allowed == nil || e.Allowed.Match(ip) {
-			return e
+		bits := 0 // nil allowlist = accept any, least specific
+		if e.Allowed != nil {
+			bits = e.Allowed.MatchBits(ip)
+		}
+		if bits > bestBits {
+			best, bestBits = e, bits
 		}
 	}
-	return nil
+	if bestBits < 0 {
+		return nil
+	}
+	return best
 }
 
 // cidrSet is a compiled endpoint source allowlist.
@@ -107,11 +117,14 @@ func NewCidrSetFromJSON(raw string) (*cidrSet, error) {
 	return c, nil
 }
 
-func (c *cidrSet) Match(addr netip.Addr) bool {
+// MatchBits returns the longest matching prefix length for addr, or -1 if none
+// matches. An empty allowlist therefore matches nothing (fail closed).
+func (c *cidrSet) MatchBits(addr netip.Addr) int {
+	best := -1
 	for _, p := range c.prefixes {
-		if p.Contains(addr) {
-			return true
+		if p.Contains(addr) && p.Bits() > best {
+			best = p.Bits()
 		}
 	}
-	return false
+	return best
 }

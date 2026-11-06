@@ -1,7 +1,10 @@
 package store
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -193,6 +196,57 @@ func AddRule(db *sql.DB, profileID int64, kind, matcher, pattern, answer string)
 	_, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, pattern, answer) VALUES (?, ?, ?, ?, ?)`,
 		profileID, kind, matcher, pattern, answer)
 	return err
+}
+
+// AddProfile creates a profile on the default org and returns its id.
+func AddProfile(db *sql.DB, name string) (int64, error) {
+	orgID, err := DefaultOrgID(db)
+	if err != nil {
+		return 0, fmt.Errorf("no org: %w", err)
+	}
+	res, err := db.Exec(`INSERT INTO profiles (org_id, name) VALUES (?, ?)`, orgID, name)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// AddEndpoint creates an endpoint bound to profileID, admitting clients whose
+// source address falls in cidrs (comma-separated IPs or prefixes). Returns the
+// endpoint's id and its generated token.
+func AddEndpoint(db *sql.DB, name string, profileID int64, cidrs string) (int64, string, error) {
+	orgID, err := DefaultOrgID(db)
+	if err != nil {
+		return 0, "", fmt.Errorf("no org: %w", err)
+	}
+	var list []string
+	for _, c := range strings.Split(cidrs, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			list = append(list, c)
+		}
+	}
+	if len(list) == 0 {
+		return 0, "", fmt.Errorf("endpoint needs at least one CIDR (fail closed otherwise)")
+	}
+	raw, err := json.Marshal(list)
+	if err != nil {
+		return 0, "", err
+	}
+	if _, err := policy.NewCidrSetFromJSON(string(raw)); err != nil {
+		return 0, "", fmt.Errorf("bad CIDR list %q: %w", cidrs, err)
+	}
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return 0, "", err
+	}
+	token := hex.EncodeToString(buf)
+	res, err := db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, name, allowed_source_ips) VALUES (?, ?, ?, ?, ?)`,
+		orgID, profileID, token, name, string(raw))
+	if err != nil {
+		return 0, "", err
+	}
+	id, _ := res.LastInsertId()
+	return id, token, nil
 }
 
 // AddBlocklistSource registers a blocklist subscription on the default org.

@@ -26,6 +26,9 @@ Usage:
                                         matchers:   domain|wildcard|tld
                                         rewrite:    domain + ANSWER (IP or name)
   opencontrol addlist URL [FORMAT]      subscribe to a blocklist (hosts|dnsmasq|adguard)
+  opencontrol addprofile NAME           create a profile, prints its id
+  opencontrol addendpoint NAME PROFILE_ID CIDR[,CIDR...]
+                                        create an endpoint; clients in CIDRs get PROFILE
 
 Env: OC_LISTEN, OC_SQLITE_PATH, OC_DATA_DIR. Config file via -config path.yaml.
 `
@@ -54,6 +57,35 @@ func main() {
 			os.Exit(2)
 		}
 		runAddRule(*cfgPath, flag.Args()[1:])
+	case "addprofile":
+		if flag.NArg() < 2 {
+			fmt.Fprint(os.Stderr, "usage: opencontrol addprofile NAME\n")
+			os.Exit(2)
+		}
+		_, db := openDB(*cfgPath)
+		defer db.Close()
+		id, err := store.AddProfile(db, flag.Arg(1))
+		if err != nil {
+			log.Fatalf("addprofile: %v", err)
+		}
+		fmt.Println(id)
+	case "addendpoint":
+		if flag.NArg() < 4 {
+			fmt.Fprint(os.Stderr, "usage: opencontrol addendpoint NAME PROFILE_ID CIDR[,CIDR...]\n")
+			os.Exit(2)
+		}
+		profileID, err := strconv.ParseInt(flag.Arg(2), 10, 64)
+		if err != nil {
+			log.Fatalf("addendpoint: PROFILE_ID must be an integer (got %q)", flag.Arg(2))
+		}
+		_, db := openDB(*cfgPath)
+		defer db.Close()
+		id, token, err := store.AddEndpoint(db, flag.Arg(1), profileID, flag.Arg(3))
+		if err != nil {
+			log.Fatalf("addendpoint: %v", err)
+		}
+		log.Printf("addendpoint: %s (id %d) → profile %d, sources %s", flag.Arg(1), id, profileID, flag.Arg(3))
+		fmt.Println(token)
 	case "addlist":
 		if flag.NArg() < 2 {
 			fmt.Fprint(os.Stderr, "usage: opencontrol addlist URL [FORMAT]\n")
