@@ -39,7 +39,8 @@ CREATE TABLE profile_rules (
     profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
     kind       TEXT NOT NULL CHECK (kind IN ('block', 'allow', 'redirect', 'rewrite')),
     matcher    TEXT NOT NULL,  -- domain | wildcard | tld
-    target     TEXT NOT NULL,  -- answer target for rewrite/redirect, else empty
+    pattern    TEXT NOT NULL,  -- domain name, or ".tld" for tld rules
+    answer     TEXT NOT NULL DEFAULT '',  -- rewrite answer (IP or name); redirect target later
     note       TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

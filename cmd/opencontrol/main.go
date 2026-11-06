@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/cloudwaddie/opencontrol/internal/config"
@@ -22,9 +21,10 @@ Usage:
   opencontrol serve                     run the resolver + policy engine
   opencontrol migrate                   apply schema migrations
   opencontrol sync                      refresh blocklist subscriptions once
-  opencontrol addrule PROFILE_ID KIND MATCHER TARGET [NOTE]
+  opencontrol addrule PROFILE_ID KIND MATCHER PATTERN [ANSWER]
                                         rule kinds: block|allow|rewrite|redirect
                                         matchers:   domain|wildcard|tld
+                                        rewrite:    domain + ANSWER (IP or name)
   opencontrol addlist URL [FORMAT]      subscribe to a blocklist (hosts|dnsmasq|adguard)
 
 Env: OC_LISTEN, OC_SQLITE_PATH, OC_DATA_DIR. Config file via -config path.yaml.
@@ -153,15 +153,15 @@ func runAddRule(cfgPath string, args []string) {
 	if err != nil {
 		log.Fatalf("addrule: PROFILE_ID must be an integer (got %q)", args[0])
 	}
-	kind, matcher, target := args[1], args[2], args[3]
-	note := ""
+	kind, matcher, pattern := args[1], args[2], args[3]
+	answer := ""
 	if len(args) > 4 {
-		note = strings.Join(args[4:], " ")
+		answer = args[4] // rewrite answer; ignored by other kinds
 	}
-	if err := store.AddRule(db, profileID, kind, matcher, target, note); err != nil {
+	if err := store.AddRule(db, profileID, kind, matcher, pattern, answer); err != nil {
 		log.Fatalf("addrule: %v", err)
 	}
-	log.Printf("addrule: %s %s %s → profile %d (pick up: restart serve or wait for snapshot refresh)", kind, matcher, target, profileID)
+	log.Printf("addrule: %s %s %s → profile %d (applies on next snapshot reload; restart serve to apply now)", kind, matcher, pattern, profileID)
 }
 
 func runAddList(cfgPath string, args []string) {

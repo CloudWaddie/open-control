@@ -111,14 +111,14 @@ func LoadSnapshot(db *sql.DB, dataDir string) (*policy.Snapshot, error) {
 	rows.Close()
 
 	// Custom rules per profile.
-	rows, err = db.Query(`SELECT profile_id, kind, matcher, target FROM profile_rules`)
+	rows, err = db.Query(`SELECT profile_id, kind, matcher, pattern, answer FROM profile_rules`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var profileID int64
-		var kind, matcher, target string
-		if err := rows.Scan(&profileID, &kind, &matcher, &target); err != nil {
+		var kind, matcher, pattern, answer string
+		if err := rows.Scan(&profileID, &kind, &matcher, &pattern, &answer); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -126,13 +126,15 @@ func LoadSnapshot(db *sql.DB, dataDir string) (*policy.Snapshot, error) {
 		if !ok {
 			continue
 		}
+		// matcher: domain (exact) | wildcard (domain + subdomains) | tld (".xyz")
+		sub := matcher != "domain"
 		switch kind {
 		case "allow":
-			p.Allow.Add(target, matcher == "wildcard")
+			p.Allow.Add(pattern, sub)
 		case "block":
-			p.Block.Add(target, matcher == "wildcard")
+			p.Block.Add(pattern, sub)
 		case "rewrite":
-			p.Rewrites[normDomain(target)] = policy.RewriteRecord{Target: target}
+			p.Rewrites[normDomain(pattern)] = policy.RewriteRecord{Target: answer}
 		case "redirect":
 			// Egress phase stub — accepted in schema, not compiled yet.
 		}
@@ -167,7 +169,8 @@ func LoadSnapshot(db *sql.DB, dataDir string) (*policy.Snapshot, error) {
 }
 
 // AddRule inserts a custom rule row (admin CLI for M1; M2 gets the API+UI).
-func AddRule(db *sql.DB, profileID int64, kind, matcher, target, note string) error {
+// pattern is the domain (or ".tld"); answer is only used by rewrite rules.
+func AddRule(db *sql.DB, profileID int64, kind, matcher, pattern, answer string) error {
 	switch kind {
 	case "block", "allow", "rewrite", "redirect":
 	default:
@@ -178,8 +181,17 @@ func AddRule(db *sql.DB, profileID int64, kind, matcher, target, note string) er
 	default:
 		return fmt.Errorf("unknown matcher %q", matcher)
 	}
-	_, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, target, note) VALUES (?, ?, ?, ?, ?)`,
-		profileID, kind, matcher, target, note)
+	if matcher == "tld" {
+		pattern = "." + strings.Trim(pattern, ".")
+	}
+	if pattern == "" || pattern == "." {
+		return fmt.Errorf("empty pattern")
+	}
+	if kind == "rewrite" && (matcher != "domain" || answer == "") {
+		return fmt.Errorf("rewrite needs an exact domain and an answer (IP or name)")
+	}
+	_, err := db.Exec(`INSERT INTO profile_rules (profile_id, kind, matcher, pattern, answer) VALUES (?, ?, ?, ?, ?)`,
+		profileID, kind, matcher, pattern, answer)
 	return err
 }
 
