@@ -44,5 +44,5 @@ jobs:
       - name: smoke test
         run: |
           docker run -d --name oc -p 15353:5353/udp opencontrol:ci
-          for i in $(seq 1 20); do docker exec oc /opencontrol healthcheck && break; sleep 1; done
+          for i in $(seq 1 20); do docker exec oc /opencontrol healthcheck 2>/dev/null && break; sleep 1; done
           docker exec oc /opencontrol healthcheck

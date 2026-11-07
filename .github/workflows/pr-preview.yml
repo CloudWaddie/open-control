@@ -1,4 +1,5 @@
-# Runs the tests, starts the server with sample data and screenshots the UI.
+# Starts the server with sample data and screenshots the UI. Tests run in CI;
+# the comment workflow reports both.
 # This workflow runs the PR's code, so it gets a read-only token and no
 # secrets. It only uploads an artifact; "PR preview comment" posts the result.
 name: PR preview
@@ -38,14 +39,6 @@ jobs:
           mkdir -p out/shots
           printf '{"pr":%s,"sha":"%s"}\n' "${{ github.event.pull_request.number }}" "${{ github.event.pull_request.head.sha }}" > out/meta.json
 
-      - name: Go tests
-        id: tests
-        run: |
-          set +e
-          go test -json ./... > out/test.json 2> out/test-stderr.txt
-          echo $? > out/test-exit
-          exit 0
-
       - name: Start server
         id: server
         run: |
@@ -55,7 +48,9 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "OC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
           nohup ./oc serve > out/server.log 2>&1 &
-          for i in $(seq 1 30); do ./oc healthcheck && exit 0; sleep 1; done
+          # The first few checks fail while the server boots; only the last matters.
+          for i in $(seq 1 30); do ./oc healthcheck 2>/dev/null && exit 0; sleep 1; done
+          ./oc healthcheck
           echo "server did not become healthy"; cat out/server.log; exit 1
 
       - name: Screenshots
@@ -79,5 +74,6 @@ jobs:
           path: out
           retention-days: 7
 
-      - name: Fail on test failures
-        run: test "$(cat out/test-exit)" = 0
+      - name: Fail if no screenshots
+        if: steps.shots.outcome != 'success'
+        run: exit 1

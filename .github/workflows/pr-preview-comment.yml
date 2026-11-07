@@ -1,11 +1,14 @@
-# Posts the "PR preview" result on the pull request. Runs from the default
-# branch with write access, and never executes code from the PR: it only reads
-# the artifact, treating every file in it as untrusted data.
+# Posts one sticky comment per pull request with the CI result and the UI
+# screenshots. It runs whenever "CI" or "PR preview" finishes and rebuilds the
+# comment from the latest run of each for the PR's head commit.
+#
+# Runs from the default branch with write access and never executes code from
+# the PR: it reads the preview artifact as untrusted data.
 name: PR preview comment
 
 on:
   workflow_run:
-    workflows: ["PR preview"]
+    workflows: ["CI", "PR preview"]
     types: [completed]
 
 permissions:
@@ -22,41 +25,55 @@ jobs:
     if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v5
-        with:
-          name: pr-preview
-          path: preview
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
-
-      # The PR number in the artifact is only trusted if that PR's head is the
-      # commit this run tested.
-      - name: Find the pull request
-        id: pr
+      - name: Collect results
+        id: collect
         uses: actions/github-script@v8
         with:
           script: |
-            const fs = require('fs');
-            const run = context.payload.workflow_run;
-            const meta = JSON.parse(fs.readFileSync('preview/meta.json', 'utf8'));
-            const number = Number(meta.pr);
-            if (!Number.isInteger(number) || number <= 0) throw new Error('bad PR number in artifact');
-            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
-            if (pr.head.sha !== run.head_sha) {
-              core.notice(`PR #${number} has moved on from ${run.head_sha}; skipping the stale preview.`);
+            const sha = context.payload.workflow_run.head_sha;
+            // The open PR whose head is this commit. Works for forks, where
+            // workflow_run.pull_requests is empty.
+            const pulls = await github.paginate(github.rest.pulls.list, { ...context.repo, state: 'open', per_page: 100 });
+            const pr = pulls.find((p) => p.head.sha === sha);
+            if (!pr) {
+              core.notice(`No open PR has ${sha} as its head (it moved on, or closed); nothing to post.`);
               return;
             }
-            core.setOutput('number', String(number));
-            core.setOutput('sha', run.head_sha);
+            const { data } = await github.rest.actions.listWorkflowRunsForRepo({ ...context.repo, head_sha: sha, event: 'pull_request', per_page: 100 });
+            const latest = (name) => data.workflow_runs.filter((r) => r.name === name).sort((a, b) => b.id - a.id)[0];
+            const ci = latest('CI');
+            const preview = latest('PR preview');
+
+            let ciJobs = [];
+            if (ci) {
+              const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, { ...context.repo, run_id: ci.id, per_page: 100 });
+              ciJobs = jobs.map((j) => ({ name: j.name, status: j.status, conclusion: j.conclusion, url: j.html_url }));
+            }
+            core.setOutput('pr', String(pr.number));
+            core.setOutput('sha', sha);
+            core.setOutput('ci', JSON.stringify({ url: ci?.html_url || '', status: ci?.status || 'missing', conclusion: ci?.conclusion || '', jobs: ciJobs }));
+            core.setOutput('preview', JSON.stringify({ url: preview?.html_url || '', status: preview?.status || 'missing', conclusion: preview?.conclusion || '' }));
+            // The artifact is uploaded even when screenshots fail, so try any finished run.
+            core.setOutput('preview_run', preview && preview.status === 'completed' ? String(preview.id) : '');
+
+      - uses: actions/download-artifact@v5
+        if: steps.collect.outputs.preview_run != ''
+        continue-on-error: true
+        with:
+          name: pr-preview
+          path: preview
+          run-id: ${{ steps.collect.outputs.preview_run }}
+          github-token: ${{ github.token }}
 
       - name: Publish screenshots
-        if: steps.pr.outputs.number != ''
+        if: steps.collect.outputs.preview_run != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ steps.pr.outputs.number }}
-          SHA: ${{ steps.pr.outputs.sha }}
+          PR: ${{ steps.collect.outputs.pr }}
+          SHA: ${{ steps.collect.outputs.sha }}
         run: |
           set -euo pipefail
+          [ -d preview/shots ] || { echo "no screenshots in the artifact"; exit 0; }
           dest="pr-$PR/${SHA:0:7}"
           git init -q previews
           cd previews
@@ -88,39 +105,42 @@ jobs:
           done
 
       - name: Comment
-        if: steps.pr.outputs.number != ''
+        if: steps.collect.outputs.pr != ''
         uses: actions/github-script@v8
         env:
-          PR: ${{ steps.pr.outputs.number }}
-          SHA: ${{ steps.pr.outputs.sha }}
+          PR: ${{ steps.collect.outputs.pr }}
+          SHA: ${{ steps.collect.outputs.sha }}
+          CI: ${{ steps.collect.outputs.ci }}
+          PREVIEW: ${{ steps.collect.outputs.preview }}
         with:
           script: |
             const fs = require('fs');
             const marker = '<!-- opencontrol-pr-preview -->';
             const pr = Number(process.env.PR);
             const sha = process.env.SHA;
+            const ci = JSON.parse(process.env.CI);
+            const preview = JSON.parse(process.env.PREVIEW);
             const read = (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '');
             // Untrusted text goes into fenced blocks with backticks removed.
             const fence = (s) => '```\n' + s.replace(/`/g, "'").slice(-4000) + '\n```';
-            const runURL = context.payload.workflow_run.html_url;
+            const mark = (status, conclusion) =>
+              status !== 'completed' ? '⏳' : conclusion === 'success' ? '✅' : conclusion === 'skipped' ? '⏭️' : '❌';
 
-            // Tests, from `go test -json`.
-            const results = { pass: [], fail: [], skip: [] };
-            for (const line of read('preview/test.json').split('\n')) {
-              let e;
-              try { e = JSON.parse(line); } catch { continue; }
-              if (e.Test && ['pass', 'fail', 'skip'].includes(e.Action)) results[e.Action].push(`${e.Package.split('/').pop()}: ${e.Test}`);
-            }
-            const exit = read('preview/test-exit').trim();
-            const testsOK = exit === '0';
-            const buildBroken = !testsOK && results.fail.length === 0;
+            // CI, from the API (trusted).
+            const ciDone = ci.status === 'completed';
+            const ciOK = ciDone && ci.conclusion === 'success';
+            const ciLine = ci.status === 'missing'
+              ? 'not started'
+              : ci.jobs.length
+                ? ci.jobs.map((j) => `${mark(j.status, j.conclusion)} [${j.name}](${j.url})`).join(' · ')
+                : `${mark(ci.status, ci.conclusion)} [run](${ci.url})`;
 
-            // Screenshots.
+            // Screenshots, from the artifact (untrusted).
             let shots = { shots: [], errors: [] };
             try { shots = JSON.parse(read('preview/shots/shots.json')); } catch {}
-            const safe = (f) => /^[a-z0-9-]+\.png$/.test(f);
+            const safe = (f) => typeof f === 'string' && /^[a-z0-9-]+\.png$/.test(f);
             const base = `https://github.com/${context.repo.owner}/${context.repo.repo}/blob/pr-previews/pr-${pr}/${sha.slice(0, 7)}`;
-            const img = (f, w) => (f && safe(f) ? `<a href="${base}/${f}"><img src="${base}/${f}?raw=true" width="${w}"></a>` : '');
+            const img = (f, w) => (safe(f) ? `<a href="${base}/${f}"><img src="${base}/${f}?raw=true" width="${w}"></a>` : '');
             const byPage = new Map();
             for (const s of shots.shots || []) {
               if (!safe(s.file)) continue;
@@ -128,26 +148,19 @@ jobs:
               if (!byPage.has(key)) byPage.set(key, {});
               byPage.get(key)[String(s.variant)] = s.file;
             }
+            const errs = (shots.errors || []).map(String);
+            const previewDone = preview.status === 'completed';
+            const previewOK = byPage.size > 0 && errs.length === 0;
 
-            const lines = [marker];
-            const icon = testsOK && (shots.errors || []).length === 0 && byPage.size > 0 ? '✅' : '⚠️';
-            lines.push(`## ${icon} Preview of ${sha.slice(0, 7)}`, '');
-            if (testsOK) {
-              lines.push(`**Tests:** ${results.pass.length} passed${results.skip.length ? `, ${results.skip.length} skipped` : ''}.`);
-            } else if (buildBroken) {
-              lines.push('**Tests:** did not run (build or vet error).', '', fence(read('preview/test-stderr.txt') || 'no output'));
-            } else {
-              lines.push(`**Tests:** ${results.fail.length} failed, ${results.pass.length} passed.`, '');
-              for (const t of results.fail.slice(0, 20)) lines.push(`- \`${t.replace(/`/g, '')}\``);
-              if (results.fail.length > 20) lines.push(`- …and ${results.fail.length - 20} more`);
-            }
-            lines.push('');
+            const head = !ciDone || !previewDone ? '⏳' : ciOK && previewOK ? '✅' : '⚠️';
+            const lines = [marker, `## ${head} Preview of ${sha.slice(0, 7)}`, '', `**CI:** ${ciLine}`, ''];
 
-            if (byPage.size === 0) {
-              lines.push('**Screenshots:** none. The server or the screenshot script failed; see the run log.', '', fence(read('preview/preview.log') || read('preview/server.log') || 'no output'));
+            if (!previewDone) {
+              lines.push(`**Screenshots:** ⏳ [in progress](${preview.url})`);
+            } else if (byPage.size === 0) {
+              lines.push(`**Screenshots:** ❌ none. The server or the screenshot script failed ([run log](${preview.url})).`, '', fence(read('preview/preview.log') || read('preview/server.log') || 'no output'));
             } else {
-              const errs = shots.errors || [];
-              lines.push(`**Browser console:** ${errs.length ? `${errs.length} error(s)` : 'no errors'}.`);
+              lines.push(`**Browser console:** ${errs.length ? `❌ ${errs.length} error(s)` : '✅ no errors'}`);
               if (errs.length) lines.push('', fence(errs.slice(0, 15).join('\n')));
               lines.push('', '<details open><summary>Screenshots</summary>', '');
               lines.push('| Page | Light | Dark | Mobile |', '| --- | --- | --- | --- |');
@@ -156,7 +169,7 @@ jobs:
               }
               lines.push('', '</details>');
             }
-            lines.push('', `<sub>[Run log](${runURL}) · sample data is seeded fresh on every run</sub>`);
+            lines.push('', `<sub>Updated when CI or the preview finishes · [preview run](${preview.url || '#'}) · sample data is seeded fresh on every run</sub>`);
             const body = lines.join('\n');
 
             const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: pr, per_page: 100 });
