@@ -179,3 +179,4 @@ client demand appears; first tagged 0.1.0.
    measure RSS + latency; add TCP listener with in-order pipelining queue
 3. SQLite migration v1 (schema §4) + `modernc.org/sqlite` WAL config
 4. Dockerfile (multi-stage → scratch, static, ~15–20 MB image) + compose for Coolify
+
