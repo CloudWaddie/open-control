@@ -1,6 +1,18 @@
 import { useEffect, useState } from 'react';
+import { ListXIcon, PlusIcon, Trash2Icon } from 'lucide-react';
 import { api, can } from '../api.js';
-import { ErrorLine, Confirm } from '../ui.jsx';
+import { Confirm, EmptyState, ErrorLine, Mono, PageHeader, SimpleSelect, TableSkeleton } from '../ui.jsx';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Field, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+
+const FORMATS = [
+  { value: 'hosts', label: 'hosts' },
+  { value: 'dnsmasq', label: 'dnsmasq' },
+  { value: 'adguard', label: 'AdGuard' },
+];
 
 export default function Blocklists({ me }) {
   const [lists, setLists] = useState(null);
@@ -39,61 +51,92 @@ export default function Blocklists({ me }) {
   }
 
   return (
-    <div className="stack">
-      <section className="card">
-        <h2>Blocklists</h2>
-        <p className="muted">
-          Subscribed lists are cached on disk and refreshed hourly. Changes take
-          effect after the next refresh; a SIGHUP reloads rules immediately.
-        </p>
-        <ErrorLine error={error} />
-        {!lists ? (
-          <p className="muted">Loading…</p>
-        ) : lists.length === 0 ? (
-          <p className="muted">No subscriptions.</p>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>URL</th>
-                <th>Format</th>
-                <th>Last synced</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {lists.map((l) => (
-                <tr key={l.id}>
-                  <td className="wrap"><code>{l.url}</code></td>
-                  <td>{l.format}</td>
-                  <td>{l.last_synced || <span className="muted">never</span>}</td>
-                  <td>
-                    {writable && <Confirm label="remove" onConfirm={() => remove(l.id)} />}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
+    <div className="flex flex-col gap-6">
+      <PageHeader
+        title="Blocklists"
+        description="Subscribed lists are cached on disk and refreshed hourly. Changes take effect after the next refresh; a SIGHUP reloads rules immediately."
+      />
+      <ErrorLine error={error} onDismiss={() => setError('')} />
+
+      <Card>
+        <CardContent>
+          {!lists ? (
+            <TableSkeleton />
+          ) : lists.length === 0 ? (
+            <EmptyState icon={ListXIcon} title="No subscriptions">
+              {writable ? 'Subscribe to a hosts, dnsmasq or AdGuard list below.' : 'An operator can add blocklists.'}
+            </EmptyState>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>URL</TableHead>
+                  <TableHead className="hidden sm:table-cell">Format</TableHead>
+                  <TableHead className="hidden md:table-cell">Last synced</TableHead>
+                  {writable && <TableHead className="w-0" />}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {lists.map((l) => (
+                  <TableRow key={l.id}>
+                    <TableCell className="max-w-md whitespace-normal">
+                      <Mono>{l.url}</Mono>
+                    </TableCell>
+                    <TableCell className="hidden text-muted-foreground sm:table-cell">{l.format}</TableCell>
+                    <TableCell className="hidden text-muted-foreground md:table-cell">
+                      {l.last_synced || 'Never'}
+                    </TableCell>
+                    {writable && (
+                      <TableCell className="text-right">
+                        <Confirm
+                          label="Remove"
+                          icon={<Trash2Icon />}
+                          title="Remove this blocklist?"
+                          description={l.url}
+                          onConfirm={() => remove(l.id)}
+                        />
+                      </TableCell>
+                    )}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
 
       {writable && (
-        <section className="card">
-          <h2>Subscribe</h2>
-          <form className="grid" onSubmit={add}>
-            <input
-              placeholder="https://example.org/hosts.txt"
-              value={form.url}
-              onChange={(e) => setForm({ ...form, url: e.target.value })}
-            />
-            <select value={form.format} onChange={(e) => setForm({ ...form, format: e.target.value })}>
-              <option value="hosts">hosts</option>
-              <option value="dnsmasq">dnsmasq</option>
-              <option value="adguard">adguard</option>
-            </select>
-            <button disabled={!form.url.trim()}>Subscribe</button>
-          </form>
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Subscribe</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={add} className="flex flex-col gap-4 sm:flex-row sm:items-end">
+              <Field className="sm:flex-1">
+                <FieldLabel htmlFor="bl-url">List URL</FieldLabel>
+                <Input
+                  id="bl-url"
+                  type="url"
+                  className="font-mono"
+                  placeholder="https://example.org/hosts.txt"
+                  value={form.url}
+                  onChange={(e) => setForm({ ...form, url: e.target.value })}
+                />
+              </Field>
+              <Field className="sm:w-40">
+                <FieldLabel>Format</FieldLabel>
+                <SimpleSelect
+                  value={form.format}
+                  options={FORMATS}
+                  onChange={(format) => setForm({ ...form, format })}
+                />
+              </Field>
+              <Button type="submit" disabled={!form.url.trim()}>
+                <PlusIcon /> Subscribe
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
       )}
     </div>
   );

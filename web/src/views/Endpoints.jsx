@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react';
+import { KeyRoundIcon, NetworkIcon, PlusIcon, RotateCwIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { api, can } from '../api.js';
-import { ErrorLine, Confirm } from '../ui.jsx';
+import { Confirm, EmptyState, ErrorLine, Mono, PageHeader, SecretValue, SimpleSelect, TableSkeleton } from '../ui.jsx';
+import { Button } from '@/components/ui/button';
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 
 export default function Endpoints({ me }) {
   const [endpoints, setEndpoints] = useState(null);
@@ -15,7 +21,7 @@ export default function Endpoints({ me }) {
       .then(([e, p]) => {
         setEndpoints(e);
         setProfiles(p);
-        setForm((f) => ({ ...f, profile_id: f.profile_id || p[0]?.id || '' }));
+        setForm((f) => ({ ...f, profile_id: f.profile_id || String(p[0]?.id ?? '') }));
       })
       .catch((e) => setError(e.message));
 
@@ -68,91 +74,153 @@ export default function Endpoints({ me }) {
   }
 
   return (
-    <div className="stack">
-      <section className="card">
-        <h2>Endpoints</h2>
-        <p className="muted">
-          A client whose source address falls in one of an endpoint's CIDRs is
-          filtered by that endpoint's profile. The most specific match wins.
-        </p>
-        <ErrorLine error={error} />
-        {!endpoints ? (
-          <p className="muted">Loading…</p>
-        ) : endpoints.length === 0 ? (
-          <p className="muted">No endpoints.</p>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Profile</th>
-                <th>Source CIDRs</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {endpoints.map((e) => (
-                <tr key={e.id}>
-                  <td>{e.name}</td>
-                  <td>{profileName(e.profile_id)}</td>
-                  <td><code>{e.cidrs.join(', ')}</code></td>
-                  <td>
-                    {writable && (
-                      <>
-                        <Confirm label="rotate token" onConfirm={() => rotate(e)} />{' '}
-                        <Confirm label="delete" onConfirm={() => remove(e.id)} />
-                      </>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </section>
+    <div className="flex flex-col gap-6">
+      <PageHeader
+        title="Endpoints"
+        description="A client whose source address falls in one of an endpoint's CIDRs is filtered by that endpoint's profile. The most specific match wins."
+      />
+      <ErrorLine error={error} onDismiss={() => setError('')} />
 
       {created && (
-        <section className="card notice">
-          <p>
-            {created.rotated
-              ? <>Token for <strong>{created.endpoint.name}</strong> rotated. The old token no longer works.</>
-              : <>Endpoint <strong>{created.endpoint.name}</strong> created.</>}{' '}
-            This token is shown once. Use it as the DoT SNI label
-            (<code>&lt;token&gt;.your.domain</code>) or in the DoH path
-            (<code>/dns-query/&lt;token&gt;</code>):
-          </p>
-          <code className="block">{created.token}</code>
-          <button className="link" onClick={() => setCreated(null)}>dismiss</button>
-        </section>
+        <Card className="ring-primary/40 bg-accent/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <KeyRoundIcon className="size-4 text-primary" />
+              {created.rotated ? `New token for ${created.endpoint.name}` : `${created.endpoint.name} created`}
+            </CardTitle>
+            <CardDescription>
+              {created.rotated && 'The old token no longer works. '}
+              Copy this token now; it is not shown again. Use it as the DoT SNI label (
+              <Mono>&lt;token&gt;.your.domain</Mono>) or in the DoH path (<Mono>/dns-query/&lt;token&gt;</Mono>).
+            </CardDescription>
+            <CardAction>
+              <Button variant="ghost" size="icon-sm" aria-label="Dismiss" onClick={() => setCreated(null)}>
+                <XIcon />
+              </Button>
+            </CardAction>
+          </CardHeader>
+          <CardContent>
+            <SecretValue value={created.token} />
+          </CardContent>
+        </Card>
       )}
 
+      <Card>
+        <CardContent>
+          {!endpoints ? (
+            <TableSkeleton />
+          ) : endpoints.length === 0 ? (
+            <EmptyState icon={NetworkIcon} title="No endpoints">
+              {writable
+                ? 'Create one below to filter a network or device with a profile.'
+                : 'An operator can add endpoints.'}
+            </EmptyState>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Name</TableHead>
+                  <TableHead>Profile</TableHead>
+                  <TableHead className="hidden sm:table-cell">Source CIDRs</TableHead>
+                  {writable && <TableHead className="w-0" />}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {endpoints.map((e) => (
+                  <TableRow key={e.id}>
+                    <TableCell className="font-medium">
+                      {e.name}
+                      <div className="mt-0.5 font-normal sm:hidden">
+                        <Mono className="text-xs text-muted-foreground">{e.cidrs.join(', ')}</Mono>
+                      </div>
+                    </TableCell>
+                    <TableCell>{profileName(e.profile_id)}</TableCell>
+                    <TableCell className="hidden whitespace-normal sm:table-cell">
+                      <div className="flex flex-wrap gap-1">
+                        {e.cidrs.map((c) => (
+                          <Mono key={c} className="rounded bg-muted px-1.5 py-0.5 text-xs">
+                            {c}
+                          </Mono>
+                        ))}
+                      </div>
+                    </TableCell>
+                    {writable && (
+                      <TableCell>
+                        <div className="flex justify-end gap-1">
+                          <Confirm
+                            label="Rotate"
+                            icon={<RotateCwIcon />}
+                            title={`Rotate the token for ${e.name}?`}
+                            description="The current token stops working immediately. Devices using it for DoT or DoH must be updated."
+                            action="Rotate token"
+                            onConfirm={() => rotate(e)}
+                          />
+                          <Confirm
+                            label="Delete"
+                            icon={<Trash2Icon />}
+                            title={`Delete ${e.name}?`}
+                            description="Its CIDRs stop matching this profile and its DoT/DoH token stops working."
+                            onConfirm={() => remove(e.id)}
+                          />
+                        </div>
+                      </TableCell>
+                    )}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        </CardContent>
+      </Card>
+
       {writable && (
-        <section className="card">
-          <h2>New endpoint</h2>
-          <form className="grid" onSubmit={create}>
-            <input
-              placeholder="name, e.g. kids-laptop"
-              value={form.name}
-              onChange={(e) => setForm({ ...form, name: e.target.value })}
-            />
-            <select
-              value={form.profile_id}
-              onChange={(e) => setForm({ ...form, profile_id: e.target.value })}
-            >
-              {profiles.map((p) => (
-                <option key={p.id} value={p.id}>{p.name}</option>
-              ))}
-            </select>
-            <input
-              placeholder="10.9.0.0/16, 192.0.2.7"
-              value={form.cidrs}
-              onChange={(e) => setForm({ ...form, cidrs: e.target.value })}
-            />
-            <button disabled={!form.name.trim() || !form.cidrs.trim() || !form.profile_id}>
-              Create
-            </button>
-          </form>
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>New endpoint</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={create} className="flex flex-col gap-4">
+              <div className="grid gap-4 md:grid-cols-3">
+                <Field>
+                  <FieldLabel htmlFor="ep-name">Name</FieldLabel>
+                  <Input
+                    id="ep-name"
+                    placeholder="kids-laptop"
+                    value={form.name}
+                    onChange={(e) => setForm({ ...form, name: e.target.value })}
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel>Profile</FieldLabel>
+                  <SimpleSelect
+                    value={form.profile_id}
+                    placeholder="No profiles"
+                    options={profiles.map((p) => ({ value: String(p.id), label: p.name }))}
+                    onChange={(profile_id) => setForm({ ...form, profile_id })}
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="ep-cidrs">Source CIDRs</FieldLabel>
+                  <Input
+                    id="ep-cidrs"
+                    className="font-mono"
+                    placeholder="10.9.0.0/16, 192.0.2.7"
+                    value={form.cidrs}
+                    onChange={(e) => setForm({ ...form, cidrs: e.target.value })}
+                  />
+                  <FieldDescription>Comma-separated. A bare IP means a single address.</FieldDescription>
+                </Field>
+              </div>
+              <Button
+                type="submit"
+                className="self-start"
+                disabled={!form.name.trim() || !form.cidrs.trim() || !form.profile_id}
+              >
+                <PlusIcon /> Create endpoint
+              </Button>
+            </form>
+          </CardContent>
+        </Card>
       )}
     </div>
   );
