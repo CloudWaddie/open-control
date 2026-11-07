@@ -1,0 +1,5 @@
+# LF everywhere, so a build on Windows produces the same bytes as CI.
+* text=auto eol=lf
+*.woff2 binary
+*.png binary
+*.ico binary
