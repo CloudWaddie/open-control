@@ -7,16 +7,19 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/cloudwaddie/opencontrol/internal/config"
 	"github.com/cloudwaddie/opencontrol/internal/control"
 	"github.com/cloudwaddie/opencontrol/internal/egress"
+	"github.com/cloudwaddie/opencontrol/internal/metrics"
 	"github.com/cloudwaddie/opencontrol/internal/qlog"
 	"github.com/cloudwaddie/opencontrol/internal/resolver"
 	"github.com/cloudwaddie/opencontrol/internal/store"
@@ -26,6 +29,9 @@ const usage = `opencontrol — self-hosted DNS filtering platform
 
 Usage:
   opencontrol serve                     run the resolver + policy engine
+  opencontrol version                   print the version
+  opencontrol healthcheck               exit 0 if the local API answers /healthz (for containers)
+  opencontrol backup FILE               write a consistent copy of the database to FILE
   opencontrol migrate                   apply schema migrations
   opencontrol sync                      refresh blocklist subscriptions once
   opencontrol addrule PROFILE_ID KIND MATCHER PATTERN [ANSWER]
@@ -40,8 +46,12 @@ Usage:
   opencontrol addendpoint NAME PROFILE_ID CIDR[,CIDR...]
                                         create an endpoint; clients in CIDRs get PROFILE
 
-Env: OC_LISTEN, OC_SQLITE_PATH, OC_DATA_DIR. Config file via -config path.yaml.
+Config file via -config path.yaml; every setting also has an OC_* env var
+(see README). Common: OC_LISTEN, OC_API_LISTEN, OC_SQLITE_PATH, OC_DATA_DIR.
 `
+
+// version is set at build time: -ldflags "-X main.version=v0.1.0".
+var version = "dev"
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
@@ -57,6 +67,16 @@ func main() {
 	switch flag.Arg(0) {
 	case "serve":
 		runServe(*cfgPath)
+	case "version":
+		fmt.Println(version)
+	case "healthcheck":
+		runHealthcheck(*cfgPath)
+	case "backup":
+		if flag.NArg() < 2 {
+			fmt.Fprint(os.Stderr, "usage: opencontrol backup FILE\n")
+			os.Exit(2)
+		}
+		runBackup(*cfgPath, flag.Arg(1))
 	case "migrate":
 		runMigrate(*cfgPath)
 	case "sync":
@@ -160,7 +180,8 @@ func defaultOrg(db *sql.DB) int64 {
 	return id
 }
 
-func openDB(cfgPath string) (*config.Config, *sql.DB) {	cfg := loadConfig(cfgPath)
+func openDB(cfgPath string) (*config.Config, *sql.DB) {
+	cfg := loadConfig(cfgPath)
 	db, err := store.Open(cfg.SQLitePath)
 	if err != nil {
 		log.Fatalf("store open: %v", err)
@@ -176,6 +197,7 @@ func openDB(cfgPath string) (*config.Config, *sql.DB) {	cfg := loadConfig(cfgPat
 
 func runServe(cfgPath string) {
 	cfg, db := openDB(cfgPath)
+	log.Printf("opencontrol %s starting", version)
 
 	// Boot from cached blocklists only: the resolver must start serving even if
 	// a list host is slow or down. Fresh lists are fetched in the background.
@@ -198,10 +220,17 @@ func runServe(cfgPath string) {
 		sinks = append(sinks, sl)
 	}
 	logger := qlog.New(db, cfg.LogBuffer, sinks...)
+	metrics.NewGauge("opencontrol_querylog_dropped_total", "Query-log events dropped (buffer full or write failed).",
+		func() float64 { return float64(logger.Dropped()) })
+
 	bg, stopBG := context.WithCancel(context.Background())
-	defer stopBG()
-	go logger.Run(bg)
-	go qlog.Retention(bg, db, cfg.LogRetentionDays)
+	var wg sync.WaitGroup
+	goBG := func(f func()) {
+		wg.Add(1)
+		go func() { defer wg.Done(); f() }()
+	}
+	goBG(func() { logger.Run(bg) })
+	goBG(func() { qlog.Retention(bg, db, cfg.LogRetentionDays) })
 
 	r := resolver.New(cfg)
 	r.SetRecorder(logger)
@@ -210,8 +239,13 @@ func runServe(cfgPath string) {
 	log.Printf("policy snapshot loaded (cached lists): %s", snap.Summary())
 
 	// reload recompiles rules + blocklists and swaps atomically; in-flight
-	// queries keep the previous snapshot, so nothing is dropped.
+	// queries keep the previous snapshot, so nothing is dropped. Reloads are
+	// serialized so a slow fetch cannot race a quick rules-only reload and
+	// install an older snapshot last.
+	var reloadMu sync.Mutex
 	reload := func(fetch bool) {
+		reloadMu.Lock()
+		defer reloadMu.Unlock()
 		s, err := store.LoadSnapshot(db, cfg.DataDir, fetch)
 		if err != nil {
 			log.Printf("policy snapshot reload failed: %v", err)
@@ -224,18 +258,23 @@ func runServe(cfgPath string) {
 	// Exit health: probe exits in the background. A state change reloads the
 	// snapshot so redirects stop (or resume) without a restart.
 	checker := &egress.Checker{DB: db, OnChange: func() { reload(false) }}
-	go checker.Run(bg)
+	goBG(func() { checker.Run(bg) })
 
-	// Triggers: first fetch right after boot, then hourly, plus SIGHUP for
-	// instant rule changes (e.g. `docker kill -s HUP`).
-	go func() {
+	// First fetch right after boot, then hourly, plus SIGHUP for instant rule
+	// changes (e.g. `docker kill -s HUP`).
+	goBG(func() {
 		reload(true)
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
-		for range t.C {
-			reload(true)
+		for {
+			select {
+			case <-bg.Done():
+				return
+			case <-t.C:
+				reload(true)
+			}
 		}
-	}()
+	})
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
@@ -248,18 +287,102 @@ func runServe(cfgPath string) {
 	api := &http.Server{
 		Addr:              cfg.APIListen,
 		Handler:           control.Handler(db, func() { reload(false) }, checker),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
+	fatal := make(chan error, 3)
 	go func() {
-		log.Printf("control: API listening on %s", cfg.APIListen)
-		if err := api.ListenAndServe(); err != nil {
-			log.Fatalf("control: %v", err)
+		log.Printf("control: API and web UI listening on %s", cfg.APIListen)
+		if err := api.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fatal <- fmt.Errorf("control: %w", err)
 		}
 	}()
 
-	if err := r.ListenAndServe(); err != nil {
-		log.Fatalf("resolver: %v", err)
+	var metricsSrv *http.Server
+	if cfg.MetricsListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", metrics.Handler())
+		metricsSrv = &http.Server{Addr: cfg.MetricsListen, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			log.Printf("metrics: listening on %s/metrics", cfg.MetricsListen)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				fatal <- fmt.Errorf("metrics: %w", err)
+			}
+		}()
 	}
+
+	go func() {
+		if err := r.ListenAndServe(); err != nil {
+			fatal <- fmt.Errorf("resolver: %w", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	exitCode := 0
+	select {
+	case sig := <-stop:
+		log.Printf("received %s, shutting down", sig)
+	case err := <-fatal:
+		log.Printf("%v; shutting down", err)
+		exitCode = 1
+	}
+
+	// Stop taking new work, let in-flight queries and requests finish, then
+	// flush the query log and close the database.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	r.Shutdown(ctx)
+	_ = api.Shutdown(ctx)
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(ctx)
+	}
+	stopBG()
+	wg.Wait()
+	if err := db.Close(); err != nil {
+		log.Printf("close database: %v", err)
+	}
+	log.Printf("stopped")
+	os.Exit(exitCode)
+}
+
+// runHealthcheck asks the local API for /healthz. Container images have no
+// curl, so the binary checks itself.
+func runHealthcheck(cfgPath string) {
+	cfg := loadConfig(cfgPath)
+	addr := cfg.APIListen
+	if host, port, err := net.SplitHostPort(addr); err == nil && (host == "" || host == "0.0.0.0" || host == "::") {
+		addr = net.JoinHostPort("127.0.0.1", port)
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "unhealthy:", err)
+		os.Exit(1)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintln(os.Stderr, "unhealthy: status", resp.Status)
+		os.Exit(1)
+	}
+}
+
+// runBackup writes a transactionally consistent copy of the live database.
+// Safe while serve is running.
+func runBackup(cfgPath, dest string) {
+	cfg := loadConfig(cfgPath)
+	db, err := store.Open(cfg.SQLitePath)
+	if err != nil {
+		log.Fatalf("backup: %v", err)
+	}
+	defer db.Close()
+	if err := store.Backup(db, dest); err != nil {
+		log.Fatalf("backup: %v", err)
+	}
+	log.Printf("backup: wrote %s", dest)
 }
 
 func runMigrate(cfgPath string) {

@@ -94,7 +94,9 @@ func TestPolicyFollowsEndpointIdentity(t *testing.T) {
 		{"token beats source IP", client{addr: "10.2.5.5:53", token: tokA}, dns.RcodeNameError, "", "B's CIDR but A's token → A's policy"},
 		{"IP in A's range", client{addr: "10.1.5.5:53"}, dns.RcodeNameError, "", "source IP matches endpoint A"},
 		{"IP in B's range", client{addr: "10.2.5.5:53"}, dns.RcodeSuccess, "10.9.9.9", "source IP matches endpoint B"},
-		{"unknown IP uses default", client{addr: "192.0.2.1:53"}, dns.RcodeNameError, "", "no endpoint → default profile"},
+		{"unknown private IP uses default", client{addr: "192.168.7.1:53"}, dns.RcodeNameError, "", "no endpoint, private network → default profile"},
+		{"unknown public IP refused", client{addr: "192.0.2.1:53"}, dns.RcodeRefused, "", "no endpoint, public network → refused (not an open resolver)"},
+		{"public IP with token", client{addr: "192.0.2.1:53", token: tokB}, dns.RcodeSuccess, "10.9.9.9", "a token works from anywhere"},
 	}
 	for _, c := range cases {
 		resp := r.answer(query("ads.test"), c.c)

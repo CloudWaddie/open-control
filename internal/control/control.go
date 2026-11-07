@@ -44,7 +44,7 @@ var roleRank = map[string]int{"viewer": 1, "operator": 2, "admin": 3}
 // Server holds the dependencies of the control API.
 type Server struct {
 	db      *sql.DB
-	reload  func()           // asks the resolver to recompile its snapshot
+	reload  func()          // asks the resolver to recompile its snapshot
 	checker *egress.Checker // probes exit nodes on demand; nil disables /check
 }
 
@@ -55,9 +55,19 @@ func Handler(db *sql.DB, reload func(), checker *egress.Checker) http.Handler {
 	s := &Server{db: db, reload: reload, checker: checker}
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+	// Liveness + readiness: the database must answer. Unauthenticated, so
+	// container health checks and load balancers can use it.
+	health := func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "db unavailable"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	}
+	mux.HandleFunc("GET /api/v1/health", health)
+	mux.HandleFunc("GET /healthz", health)
 	mux.Handle("GET /api/v1/whoami", s.require("viewer", s.whoami))
 
 	mux.Handle("GET /api/v1/profiles", s.require("viewer", s.listProfiles))
@@ -91,7 +101,29 @@ func Handler(db *sql.DB, reload func(), checker *egress.Checker) http.Handler {
 	// Everything else is the web UI (see internal/web).
 	mux.Handle("/", web.Handler())
 
-	return mux
+	return securityHeaders(mux)
+}
+
+// securityHeaders applies browser hardening to every response. The UI loads
+// only its own scripts; inline style attributes are allowed because the
+// component library positions popovers with them.
+func securityHeaders(next http.Handler) http.Handler {
+	const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; " +
+		"base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", csp)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			h.Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // require authenticates the bearer token and enforces a minimum role.

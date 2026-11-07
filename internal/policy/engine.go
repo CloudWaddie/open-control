@@ -33,12 +33,12 @@ type Profile struct {
 	ID         int64
 	OrgID      int64
 	Name       string
-	Allow      *domainSet            // custom BYPASS rules
-	Block      *domainSet            // custom BLOCK rules
-	Blocklists *domainSet            // union of all org blocklist sources
+	Allow      *domainSet               // custom BYPASS rules
+	Block      *domainSet               // custom BLOCK rules
+	Blocklists *domainSet               // union of all org blocklist sources
 	Rewrites   map[string]RewriteRecord // exact-domain rewrites
-	Redirect   *domainSet            // redirect rules (keys index RedirectTo)
-	RedirectTo map[string]*Exit      // matched key → exit node
+	Redirect   *domainSet               // redirect rules (keys index RedirectTo)
+	RedirectTo map[string]*Exit         // matched key → exit node
 }
 
 // Exit is an egress node a redirect rule can point at. Healthy is the state
@@ -111,6 +111,14 @@ func (s *Snapshot) Summary() string {
 // client with the most specific (longest) prefix, so a /32 endpoint beats a
 // broad /0 one regardless of load order. No match → nil.
 func (s *Snapshot) EndpointForClientIP(ip netip.Addr) *Endpoint {
+	ep, _ := s.MatchClientIP(ip)
+	return ep
+}
+
+// MatchClientIP is EndpointForClientIP plus the matched prefix length: 0 for a
+// catch-all (0.0.0.0/0) endpoint, -1 when nothing matched.
+func (s *Snapshot) MatchClientIP(ip netip.Addr) (*Endpoint, int) {
+	ip = ip.Unmap()
 	var best *Endpoint
 	bestBits := -1
 	for _, e := range s.endpoints {
@@ -123,9 +131,9 @@ func (s *Snapshot) EndpointForClientIP(ip netip.Addr) *Endpoint {
 		}
 	}
 	if bestBits < 0 {
-		return nil
+		return nil, -1
 	}
-	return best
+	return best, bestBits
 }
 
 // cidrSet is a compiled endpoint source allowlist.

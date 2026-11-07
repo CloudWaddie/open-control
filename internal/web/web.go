@@ -35,6 +35,13 @@ func Handler() http.Handler {
 		if clean == "" {
 			clean = "index.html"
 		}
+		// Hashed build assets never change; everything else (index.html,
+		// theme-init.js) must be revalidated so a new release shows up at once.
+		if strings.HasPrefix(clean, "assets/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
 		if _, err := fs.Stat(sub, clean); err == nil {
 			files.ServeHTTP(w, r)
 			return

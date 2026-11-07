@@ -1,21 +1,47 @@
-# Open Control — Coolify/docker compose deployment (M0).
-# DNS ports must be exposed natively; they cannot go through Coolify's
-# HTTP proxy/TLS termination. Stop any host-level DNS service first.
+# Open Control — docker compose deployment (works on Coolify).
+#
+# DNS ports are published directly; they cannot go through an HTTP proxy.
+# Stop any host DNS service on port 53 first (e.g. systemd-resolved's stub).
+#
+# The web UI/API listens on 8080 inside the container. Put it behind your
+# reverse proxy (Coolify does this when you assign a domain), or publish it on
+# localhost only as below and use an SSH tunnel.
 services:
   opencontrol:
-    build: .
+    build:
+      context: .
+      args:
+        VERSION: ${OC_VERSION:-dev}
     image: opencontrol:latest
     container_name: opencontrol
     restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
     environment:
-      OC_LISTEN: ":53"
-      OC_SQLITE_PATH: "/data/opencontrol.db"
-      OC_DATA_DIR: "/data"
+      # Networks allowed to use plain DNS without an endpoint. Defaults to
+      # private ranges. Your router's public IP belongs in an endpoint instead.
+      # OC_PLAIN_DNS_ALLOW: "10.0.0.0/8,192.168.0.0/16"
+      OC_RATE_LIMIT_QPS: "100"
+      OC_LOG_RETENTION_DAYS: "7"
+      # Reverse proxy addresses whose X-Forwarded-For is trusted.
+      # OC_TRUSTED_PROXIES: "172.16.0.0/12"
+      # Encrypted DNS (needs a certificate; see README):
+      # OC_DOT_LISTEN: ":8853"
+      # OC_DOH_LISTEN: ":8443"
+      # OC_TLS_CERT: /certs/fullchain.pem
+      # OC_TLS_KEY: /certs/privkey.pem
+      # OC_METRICS_LISTEN: ":9153"
     ports:
-      - "53:53/udp"
-      - "53:53/tcp"
+      - "53:5353/udp"
+      - "53:5353/tcp"
+      - "127.0.0.1:8080:8080/tcp"
+      # - "853:8853/tcp"   # DoT
+      # - "443:8443/tcp"   # DoH (only if nothing else owns 443)
     volumes:
       - opencontrol-data:/data
+      # - /etc/letsencrypt/live/dns.example.com:/certs:ro
 
 volumes:
   opencontrol-data:

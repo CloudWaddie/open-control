@@ -13,6 +13,7 @@
 package resolver
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +34,7 @@ import (
 
 	"github.com/cloudwaddie/opencontrol/internal/cache"
 	"github.com/cloudwaddie/opencontrol/internal/config"
+	"github.com/cloudwaddie/opencontrol/internal/metrics"
 	"github.com/cloudwaddie/opencontrol/internal/policy"
 	"github.com/cloudwaddie/opencontrol/internal/store"
 )
@@ -52,7 +55,21 @@ type Resolver struct {
 	recorder  atomic.Pointer[Recorder]
 	udpClient dns.Client
 	tcpClient dns.Client
+	limit     *limiter
+
+	mu      sync.Mutex
+	dnsSrvs []*dns.Server
+	httpSrv *http.Server
 }
+
+var (
+	mQueries  = metrics.NewCounter("opencontrol_dns_queries_total", "DNS queries by outcome.", "action")
+	mDropped  = metrics.NewCounter("opencontrol_dns_dropped_total", "Queries dropped before policy, by reason.", "reason")
+	mCache    = metrics.NewCounter("opencontrol_dns_cache_total", "Cache lookups by result.", "result")
+	mUpErrors = metrics.NewCounter("opencontrol_upstream_errors_total", "Failed upstream exchanges by upstream.", "upstream")
+	mUpTime   = metrics.NewHistogram("opencontrol_upstream_duration_seconds", "Upstream exchange latency.",
+		[]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5})
+)
 
 // SetSnapshot hot-swaps the compiled policy state (loaded from the store).
 // Safe to call at any time; in-flight queries keep the old snapshot.
@@ -70,8 +87,9 @@ func New(cfg *config.Config) *Resolver {
 		cfg:       cfg,
 		cache:     cache.New(cfg.Cache.MaxEntries),
 		upstreams: cfg.Upstreams,
-		udpClient: dns.Client{Net: "udp", Timeout: 3 * time.Second, UDPSize: 4096},
-		tcpClient: dns.Client{Net: "tcp", Timeout: 5 * time.Second},
+		udpClient: dns.Client{Net: "udp", Timeout: 2 * time.Second, UDPSize: ednsSize},
+		tcpClient: dns.Client{Net: "tcp", Timeout: 4 * time.Second},
+		limit:     newLimiter(cfg.RateLimitQPS),
 	}
 }
 
@@ -95,6 +113,11 @@ type verdict struct {
 func (r *Resolver) answer(req *dns.Msg, c client) *dns.Msg {
 	var v verdict
 	resp := r.decide(req, c, &v)
+	mQueries.Inc(v.action)
+	if v.reason == "not-allowed" {
+		// Unattributed and possibly hostile; counted, not stored.
+		return resp
+	}
 	if rec := r.recorder.Load(); rec != nil && req != nil && len(req.Question) == 1 {
 		q := req.Question[0]
 		(*rec).Record(store.QueryLog{
@@ -125,6 +148,12 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 		return refusal(req, dns.RcodeNotImplemented)
 	}
 	q := req.Question[0]
+	if q.Qtype == dns.TypeANY {
+		// RFC 8482: a minimal answer instead of everything we know, which
+		// removes ANY as an amplification vector.
+		v.action, v.reason = "forward", "rfc8482"
+		return anyReply(req, q)
+	}
 	key := cache.MakeKey(req)
 
 	// fallback records why a redirect was not applied (exit down), so the
@@ -143,7 +172,7 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 		if c.token != "" {
 			ep := snap.EndpointForToken(c.token)
 			if ep == nil {
-				log.Printf("resolver: REFUSED %s — unknown endpoint token via %s", q.Name, c.addr)
+				r.debugf("resolver: REFUSED %s — unknown endpoint token via %s", q.Name, c.addr)
 				v.action, v.reason = "refused", "unknown-token"
 				return refusal(req, dns.RcodeRefused)
 			}
@@ -154,7 +183,16 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 			}
 			v.endpoint = ep.ID
 		} else {
-			if ep := snap.EndpointForClientIP(clientIP(c.addr)); ep != nil {
+			ip := clientIP(c.addr)
+			ep, bits := snap.MatchClientIP(ip)
+			// Only a specific endpoint (narrower than 0.0.0.0/0) or a trusted
+			// network may use the resolver without a token. Anyone else is
+			// refused, so a public server is not an open resolver.
+			if bits <= 0 && !r.cfg.PlainDNSAllowed(ip) {
+				v.action, v.reason = "refused", "not-allowed"
+				return refusal(req, dns.RcodeRefused)
+			}
+			if ep != nil {
 				prof = snap.ProfileForEndpoint(ep.ProfileID)
 				v.endpoint = ep.ID
 			}
@@ -170,21 +208,21 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 			d := snap.Evaluate(prof, q.Name)
 			switch d.Action {
 			case policy.ActionBlock:
-				log.Printf("resolver: BLOCK %s (%s) via %s", q.Name, d.Reason, c.addr)
+				r.debugf("resolver: BLOCK %s (%s) via %s", q.Name, d.Reason, c.addr)
 				v.action, v.reason = "block", d.Reason
 				return refusal(req, dns.RcodeNameError)
 			case policy.ActionRewrite:
-				log.Printf("resolver: REWRITE %s -> %s via %s", q.Name, d.Target, c.addr)
+				r.debugf("resolver: REWRITE %s -> %s via %s", q.Name, d.Target, c.addr)
 				v.action, v.reason = "rewrite", d.Target
 				return rewriteReply(req, q, d.Target)
 			case policy.ActionRedirect:
 				if d.ExitHealthy {
-					log.Printf("resolver: REDIRECT %s → exit %s (%s) via %s", q.Name, d.ExitName, d.Target, c.addr)
+					r.debugf("resolver: REDIRECT %s → exit %s (%s) via %s", q.Name, d.ExitName, d.Target, c.addr)
 					v.action, v.reason = "redirect", d.ExitName
 					return redirectReply(req, q, d.Target)
 				}
 				// The exit is down: resolve normally and say so in the log.
-				log.Printf("resolver: REDIRECT %s skipped, exit %s is down; forwarding", q.Name, d.ExitName)
+				r.debugf("resolver: REDIRECT %s skipped, exit %s is down; forwarding", q.Name, d.ExitName)
 				fallback = "exit-down:" + d.ExitName
 			}
 		}
@@ -192,13 +230,17 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 
 	// Cache: serve the response if we still have it.
 	if msg := r.cache.Get(key, req.Id); msg != nil {
+		mCache.Inc("hit")
 		v.action, v.reason = "forward", forwardReason("cache")
 		return msg
 	}
 
+	mCache.Inc("miss")
+
 	// Single in-flight upstream fetch per key (PLAN.md M0, recovery).
+	do := isDO(req)
 	res, _, _ := r.sf.Do(key, func() (any, error) {
-		return r.forward(&q), nil
+		return r.forward(&q, do), nil
 	})
 	up, _ := res.(*dns.Msg)
 	if up == nil {
@@ -223,7 +265,22 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 // handle serves UDP, TCP and DoT (miekg/dns handler).
 func (r *Resolver) handle(w dns.ResponseWriter, req *dns.Msg) {
 	c := client{addr: remoteAddr(w), token: tokenFromSNI(w)}
-	_ = w.WriteMsg(r.answer(req, c))
+	_, udp := w.RemoteAddr().(*net.UDPAddr)
+	if !r.limit.allow(clientIP(c.addr), time.Now()) {
+		mDropped.Inc("ratelimited")
+		if udp {
+			return // silence: replying would still amplify a spoofed source
+		}
+		_ = w.WriteMsg(refusal(req, dns.RcodeRefused))
+		return
+	}
+	_ = w.WriteMsg(finalize(req, r.answer(req, c), udp))
+}
+
+func (r *Resolver) debugf(format string, args ...any) {
+	if r.cfg.LogQueries {
+		log.Printf(format, args...)
+	}
 }
 
 // ListenAndServe starts every configured listener and blocks until one fails.
@@ -249,25 +306,56 @@ func (r *Resolver) ListenAndServe() error {
 		go func() { errc <- f() }()
 	}
 
-	udp := &dns.Server{Addr: r.cfg.Listen, Net: "udp", Handler: mux, UDPSize: 4096}
-	tcp := &dns.Server{Addr: r.cfg.Listen, Net: "tcp", Handler: mux}
+	// TCP-based servers get idle limits so slow or idle clients cannot pin
+	// connections indefinitely.
+	idle := func() time.Duration { return 10 * time.Second }
+	udp := &dns.Server{Addr: r.cfg.Listen, Net: "udp", Handler: mux, UDPSize: ednsSize}
+	tcp := &dns.Server{Addr: r.cfg.Listen, Net: "tcp", Handler: mux, IdleTimeout: idle,
+		ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+	r.track(udp, tcp)
 	start("UDP", r.cfg.Listen, udp.ListenAndServe)
 	start("TCP", r.cfg.Listen, tcp.ListenAndServe)
 
 	if r.cfg.DoTListen != "" {
-		dot := &dns.Server{Addr: r.cfg.DoTListen, Net: "tcp-tls", TLSConfig: tlsCfg, Handler: mux}
+		dot := &dns.Server{Addr: r.cfg.DoTListen, Net: "tcp-tls", TLSConfig: tlsCfg, Handler: mux,
+			IdleTimeout: idle, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+		r.track(dot)
 		start("DoT", r.cfg.DoTListen, dot.ListenAndServe)
 	}
 	if r.cfg.DoHListen != "" {
 		hm := http.NewServeMux()
 		hm.Handle("/dns-query", r.dohHandler())
 		hm.Handle("/dns-query/", r.dohHandler())
-		doh := &http.Server{Addr: r.cfg.DoHListen, Handler: hm, TLSConfig: tlsCfg, ReadHeaderTimeout: 10 * time.Second}
+		doh := &http.Server{Addr: r.cfg.DoHListen, Handler: hm, TLSConfig: tlsCfg,
+			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+			WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+		r.mu.Lock()
+		r.httpSrv = doh
+		r.mu.Unlock()
 		start("DoH", r.cfg.DoHListen, func() error { return doh.ListenAndServeTLS("", "") })
 	}
 
 	// The first listener to fail stops the process; the caller exits.
 	return <-errc
+}
+
+func (r *Resolver) track(srvs ...*dns.Server) {
+	r.mu.Lock()
+	r.dnsSrvs = append(r.dnsSrvs, srvs...)
+	r.mu.Unlock()
+}
+
+// Shutdown stops every listener and waits for in-flight queries, up to ctx.
+func (r *Resolver) Shutdown(ctx context.Context) {
+	r.mu.Lock()
+	srvs, doh := r.dnsSrvs, r.httpSrv
+	r.mu.Unlock()
+	for _, s := range srvs {
+		_ = s.ShutdownContext(ctx)
+	}
+	if doh != nil {
+		_ = doh.Shutdown(ctx)
+	}
 }
 
 // dohHandler implements RFC 8484 GET and POST. The endpoint token, if any, is
@@ -286,7 +374,12 @@ func (r *Resolver) dohHandler() http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		resp := r.answer(req, client{addr: hr.RemoteAddr, token: rest})
+		if !r.limit.allow(clientIP(hr.RemoteAddr), time.Now()) {
+			mDropped.Inc("ratelimited")
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		resp := finalize(req, r.answer(req, client{addr: hr.RemoteAddr, token: rest}), false)
 		packed, err := resp.Pack()
 		if err != nil {
 			http.Error(w, "pack failed", http.StatusInternalServerError)
@@ -374,35 +467,100 @@ func clientHost(addr string) string {
 	return addr
 }
 
-// forward sends the question to the next upstream, UDP first with TCP fallback
-// on truncation. On success the returned message already has TTL clamps applied
-// so the cache can immediately reuse the same message.
-func (r *Resolver) forward(q *dns.Question) *dns.Msg {
-
-	upstream := r.upstreams[int(r.robin.Add(1))%len(r.upstreams)]
-
+// forward sends the question upstream, UDP first with TCP fallback on
+// truncation. A failing upstream is skipped and the next one tried, so one dead
+// resolver does not turn into SERVFAILs. On success the returned message already
+// has TTL clamps applied so the cache can reuse it directly.
+func (r *Resolver) forward(q *dns.Question, do bool) *dns.Msg {
 	req := new(dns.Msg)
 	req.Id = dns.Id()
 	req.RecursionDesired = true
 	req.Question = []dns.Question{*q}
+	req.SetEdns0(ednsSize, do)
 
-	resp, _, err := r.udpClient.Exchange(req, upstream)
-	if err != nil || resp == nil {
-		log.Printf("resolver: udp upstream %s failed: %v", upstream, err)
-		return nil
+	n := len(r.upstreams)
+	first := int(r.robin.Add(1))
+	for i := 0; i < n; i++ {
+		upstream := r.upstreams[(first+i)%n]
+		start := time.Now()
+		resp, _, err := r.udpClient.Exchange(req, upstream)
+		if err == nil && resp != nil && resp.Truncated {
+			// UDP answer exceeded size; retry over TCP per standard practice.
+			resp, _, err = r.tcpClient.Exchange(req, upstream)
+		}
+		if err != nil || resp == nil || resp.Rcode == dns.RcodeServerFailure || resp.Rcode == dns.RcodeRefused {
+			mUpErrors.Inc(upstream)
+			log.Printf("resolver: upstream %s failed for %s: %v", upstream, q.Name, upstreamErr(resp, err))
+			continue
+		}
+		mUpTime.Observe(time.Since(start))
+		if r.cfg.Cache.MaxTTL > 0 {
+			clampTTLs(resp, r.cfg.Cache.MinTTL, r.cfg.Cache.MaxTTL)
+		}
+		return resp
 	}
-	if resp.Truncated {
-		// UDP answer exceeded size; retry over TCP per standard practice.
-		resp, _, err = r.tcpClient.Exchange(req, upstream)
-		if err != nil || resp == nil {
-			log.Printf("resolver: tcp fallback %s failed: %v", upstream, err)
-			return nil
+	return nil
+}
+
+func upstreamErr(resp *dns.Msg, err error) any {
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return "no response"
+	}
+	return dns.RcodeToString[resp.Rcode]
+}
+
+// ednsSize is the EDNS buffer size we advertise and accept: the DNS Flag Day
+// 2020 value that avoids IP fragmentation.
+const ednsSize = 1232
+
+func isDO(req *dns.Msg) bool {
+	if opt := req.IsEdns0(); opt != nil {
+		return opt.Do()
+	}
+	return false
+}
+
+// finalize shapes a reply for the client that asked: our own OPT record (never
+// the upstream's) when the client used EDNS, and truncation to the client's
+// buffer size over UDP so oversized answers set TC and the client retries on TCP.
+func finalize(req, resp *dns.Msg, udp bool) *dns.Msg {
+	if req == nil || resp == nil {
+		return resp
+	}
+	extra := resp.Extra[:0:0]
+	for _, rr := range resp.Extra {
+		if rr.Header().Rrtype != dns.TypeOPT {
+			extra = append(extra, rr)
 		}
 	}
-
-	if r.cfg.Cache.MaxTTL > 0 {
-		clampTTLs(resp, r.cfg.Cache.MinTTL, r.cfg.Cache.MaxTTL)
+	resp.Extra = extra
+	size := dns.MinMsgSize
+	if opt := req.IsEdns0(); opt != nil {
+		resp.SetEdns0(ednsSize, opt.Do())
+		if s := int(opt.UDPSize()); s > size {
+			size = s
+		}
+		if size > ednsSize {
+			size = ednsSize
+		}
 	}
+	if udp {
+		resp.Truncate(size)
+	}
+	return resp
+}
+
+// anyReply is the RFC 8482 answer to a qtype ANY query: one synthesized HINFO.
+func anyReply(req *dns.Msg, q dns.Question) *dns.Msg {
+	resp := new(dns.Msg)
+	resp.SetReply(req)
+	resp.Answer = []dns.RR{&dns.HINFO{
+		Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeHINFO, Class: dns.ClassINET, Ttl: 3600},
+		Cpu: "RFC8482",
+	}}
 	return resp
 }
 
