@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/cloudwaddie/opencontrol/internal/policy"
@@ -156,7 +157,12 @@ func ListBlocklists(db DBTX, org int64) ([]Blocklist, error) {
 }
 
 func DeleteBlocklist(db DBTX, org, id int64) error {
-	return deleteRow(db, `DELETE FROM blocklist_sources WHERE id = ? AND org_id = ?`, id, org)
+	if err := deleteRow(db, `DELETE FROM blocklist_sources WHERE id = ? AND org_id = ?`, id, org); err != nil {
+		return err
+	}
+	_, err := db.Exec(`DELETE FROM profile_filters WHERE kind = 'list' AND ref = ?
+		AND profile_id IN (SELECT id FROM profiles WHERE org_id = ?)`, strconv.FormatInt(id, 10), org)
+	return err
 }
 
 // ListAudit returns the org's newest audit entries first.

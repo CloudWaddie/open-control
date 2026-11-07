@@ -39,8 +39,7 @@ func fakeUpstream(t *testing.T) string {
 func newRedirectResolver(t *testing.T, exitHealthy bool, upstream string) (*Resolver, *captureRecorder) {
 	t.Helper()
 	exit := &policy.Exit{ID: 7, Name: "vps", AnswerIP: "10.77.0.1", Healthy: exitHealthy}
-	p := &policy.Profile{ID: 1, Allow: policy.NewDomainSet(), Block: policy.NewDomainSet(),
-		Blocklists: policy.NewDomainSet(), Rewrites: map[string]policy.RewriteRecord{},
+	p := &policy.Profile{ID: 1, Allow: policy.NewDomainSet(), Block: policy.NewDomainSet(), Rewrites: map[string]policy.RewriteRecord{},
 		Redirect: policy.NewDomainSet(), RedirectTo: map[string]*policy.Exit{}}
 	p.Redirect.Add("netflix.test", true)
 	p.RedirectTo["netflix.test"] = exit

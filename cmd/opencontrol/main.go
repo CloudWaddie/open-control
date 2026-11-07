@@ -20,6 +20,7 @@ import (
 	"github.com/cloudwaddie/opencontrol/internal/control"
 	"github.com/cloudwaddie/opencontrol/internal/egress"
 	"github.com/cloudwaddie/opencontrol/internal/metrics"
+	"github.com/cloudwaddie/opencontrol/internal/policy"
 	"github.com/cloudwaddie/opencontrol/internal/qlog"
 	"github.com/cloudwaddie/opencontrol/internal/resolver"
 	"github.com/cloudwaddie/opencontrol/internal/store"
@@ -201,7 +202,7 @@ func runServe(cfgPath string) {
 
 	// Boot from cached blocklists only: the resolver must start serving even if
 	// a list host is slow or down. Fresh lists are fetched in the background.
-	snap, err := store.LoadSnapshot(db, cfg.DataDir, false)
+	snap, err := store.LoadSnapshot(db, cfg.DataDir, policy.FetchNone)
 	if err != nil {
 		log.Fatalf("policy snapshot: %v", err)
 	}
@@ -246,7 +247,11 @@ func runServe(cfgPath string) {
 	reload := func(fetch bool) {
 		reloadMu.Lock()
 		defer reloadMu.Unlock()
-		s, err := store.LoadSnapshot(db, cfg.DataDir, fetch)
+		mode := policy.FetchMissing // a settings change: download newly enabled lists
+		if fetch {
+			mode = policy.FetchAll
+		}
+		s, err := store.LoadSnapshot(db, cfg.DataDir, mode)
 		if err != nil {
 			log.Printf("policy snapshot reload failed: %v", err)
 			return
@@ -286,7 +291,7 @@ func runServe(cfgPath string) {
 	// Control plane. Writes reload the snapshot immediately.
 	api := &http.Server{
 		Addr:              cfg.APIListen,
-		Handler:           control.Handler(db, func() { reload(false) }, checker),
+		Handler:           control.Handler(db, func() { reload(false) }, checker, cfg.DataDir),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -401,7 +406,7 @@ func runMigrate(cfgPath string) {
 func runSync(cfgPath string) {
 	cfg, db := openDB(cfgPath)
 	defer db.Close()
-	snap, err := store.LoadSnapshot(db, cfg.DataDir, true)
+	snap, err := store.LoadSnapshot(db, cfg.DataDir, policy.FetchAll)
 	if err != nil {
 		log.Fatalf("sync: %v", err)
 	}
@@ -437,7 +442,7 @@ func runAddList(cfgPath string, args []string) {
 	if len(args) > 1 {
 		format = args[1]
 	}
-	if err := store.AddBlocklistSource(db, defaultOrg(db), url, format); err != nil {
+	if _, err := store.AddBlocklistSource(db, defaultOrg(db), url, format); err != nil {
 		log.Fatalf("addlist: %v", err)
 	}
 	log.Printf("addlist: %s (%s) subscribed — run 'opencontrol sync' to fetch now", url, format)

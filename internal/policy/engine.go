@@ -35,10 +35,28 @@ type Profile struct {
 	Name       string
 	Allow      *domainSet               // custom BYPASS rules
 	Block      *domainSet               // custom BLOCK rules
-	Blocklists *domainSet               // union of all org blocklist sources
 	Rewrites   map[string]RewriteRecord // exact-domain rewrites
 	Redirect   *domainSet               // redirect rules (keys index RedirectTo)
 	RedirectTo map[string]*Exit         // matched key → exit node
+
+	Lists           []ListRef      // enabled filter categories and custom lists (block)
+	ServiceAllow    []ListRef      // services that bypass every list
+	ServiceBlock    []ListRef      // blocked services
+	ServiceRedirect []ServiceRoute // services sent through an exit
+}
+
+// ListRef is a shared compiled list plus the reason prefix logged on a match,
+// e.g. "filter:ads" or "service:tiktok".
+type ListRef struct {
+	Set    *DomainSet
+	Reason string
+}
+
+// ServiceRoute sends a whole service through an exit node.
+type ServiceRoute struct {
+	Set    *DomainSet
+	Reason string
+	Exit   *Exit
 }
 
 // Exit is an egress node a redirect rule can point at. Healthy is the state
@@ -102,7 +120,16 @@ func (s *Snapshot) DefaultProfile() *Profile {
 func (s *Snapshot) Summary() string {
 	defaults := 0
 	for _, p := range s.profiles {
-		defaults += p.Blocklists.Size() + p.Block.Size() + p.Allow.Size() + len(p.Rewrites)
+		defaults += p.Block.Size() + p.Allow.Size() + len(p.Rewrites)
+	}
+	lists := map[*DomainSet]bool{}
+	for _, p := range s.profiles {
+		for _, l := range p.Lists {
+			lists[l.Set] = true
+		}
+	}
+	for l := range lists {
+		defaults += l.Size()
 	}
 	return fmt.Sprintf("%d endpoint(s), %d profile(s), %d rule entries", len(s.endpoints), len(s.profiles), defaults)
 }

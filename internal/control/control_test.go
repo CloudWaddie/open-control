@@ -41,7 +41,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	f := &fixture{t: t, db: db, reloads: make(chan struct{}, 32)}
-	f.h = Handler(db, func() { f.reloads <- struct{}{} }, nil)
+	f.h = Handler(db, func() { f.reloads <- struct{}{} }, nil, t.TempDir())
 	org, err := store.DefaultOrgID(db)
 	if err != nil {
 		t.Fatal(err)

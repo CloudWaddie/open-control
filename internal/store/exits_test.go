@@ -71,7 +71,7 @@ func TestRedirectReachesSnapshotAndHealthFollows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snap, err := LoadSnapshot(db, t.TempDir(), false)
+	snap, err := LoadSnapshot(db, t.TempDir(), policy.FetchNone)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestRedirectReachesSnapshotAndHealthFollows(t *testing.T) {
 	if err := SetExitHealth(db, exitA, "down"); err != nil {
 		t.Fatal(err)
 	}
-	snap, _ = LoadSnapshot(db, t.TempDir(), false)
+	snap, _ = LoadSnapshot(db, t.TempDir(), policy.FetchNone)
 	if d := snap.Evaluate(snap.ProfileForEndpoint(1), "netflix.test."); d.ExitHealthy {
 		t.Error("down exit still reported healthy")
 	}

@@ -86,8 +86,10 @@ const NAV = [
   },
 ];
 
+// "#/profiles/3/services" → ['profiles', '3', 'services']
 function currentRoute() {
-  return window.location.hash.replace(/^#\/?/, '') || 'overview';
+  const path = window.location.hash.replace(/^#\/?/, '') || 'overview';
+  return path.split('/').filter(Boolean);
 }
 
 export function BrandMark({ className = 'size-7' }) {
@@ -138,7 +140,7 @@ export default function App() {
     (g) => g.items.length,
   );
   const visible = groups.flatMap((g) => g.items);
-  const active = visible.find((n) => n.id === route) || visible[0];
+  const active = visible.find((n) => n.id === route[0]) || visible[0];
   const View = active.view;
 
   function signOut() {
@@ -157,13 +159,13 @@ export default function App() {
           setTheme={setTheme}
           onSignOut={signOut}
         />
-        <SidebarInset>
+        <SidebarInset className="min-w-0">
           <header className="sticky top-0 z-10 flex h-12 items-center gap-2 border-b bg-background/85 px-3 backdrop-blur md:hidden">
             <SidebarTrigger />
             <span className="text-sm font-medium">{active.label}</span>
           </header>
           <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
-            <View key={active.id} me={me} />
+            <View key={active.id} me={me} params={active.id === route[0] ? route.slice(1) : []} />
           </main>
         </SidebarInset>
       </SidebarProvider>

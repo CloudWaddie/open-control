@@ -24,6 +24,9 @@ type domainSet struct {
 	m map[string]matchKind
 }
 
+// DomainSet is the exported name for compiled domain sets (lists, services).
+type DomainSet = domainSet
+
 // NewDomainSet builds an empty set.
 func NewDomainSet() *domainSet { return &domainSet{m: make(map[string]matchKind)} }
 

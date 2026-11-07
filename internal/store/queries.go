@@ -10,7 +10,9 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/cloudwaddie/opencontrol/internal/catalog"
 	"github.com/cloudwaddie/opencontrol/internal/policy"
 )
 
@@ -93,10 +95,11 @@ func DefaultOrgID(db DBTX) (int64, error) {
 // Blocklist contents are read through the ETag file cache; a DB row marks the
 // last successful fetch.
 //
-// fetch=false reads blocklists from the on-disk cache only (no network), so
-// startup never waits on a remote host. fetch=true refreshes them first.
-func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error) {
-	blDir := dataDir + "/blocklists"
+// mode says when lists go to the network: FetchNone at boot (never wait on a
+// remote host), FetchMissing after a settings change (download newly enabled
+// lists), FetchAll on the periodic refresh.
+func LoadSnapshot(db DBTX, dataDir string, mode policy.FetchMode) (*policy.Snapshot, error) {
+	blDir := catalog.CacheDir(dataDir)
 
 	// Profiles
 	profs := map[int64]*policy.Profile{}
@@ -112,61 +115,12 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 		}
 		p.Allow = policy.NewDomainSet()
 		p.Block = policy.NewDomainSet()
-		p.Blocklists = policy.NewDomainSet()
 		p.Rewrites = map[string]policy.RewriteRecord{}
 		p.Redirect = policy.NewDomainSet()
 		p.RedirectTo = map[string]*policy.Exit{}
 		profs[p.ID] = &p
 	}
 	rows.Close()
-
-	// Read every source and CLOSE the cursor before doing anything else: the DB
-	// pool has one connection, so writing while a cursor is open deadlocks.
-	type source struct {
-		id, orgID int64
-		url       string
-	}
-	var sources []source
-	rows, err = db.Query(`SELECT id, org_id, url FROM blocklist_sources`)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var s source
-		if err := rows.Scan(&s.id, &s.orgID, &s.url); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		sources = append(sources, s)
-	}
-	rows.Close()
-
-	// Each org's lists go only into that org's profiles.
-	for _, s := range sources {
-		var domains []string
-		var err error
-		if fetch {
-			domains, err = policy.FetchBlocklist(s.url, blDir)
-			if err == nil {
-				if _, uerr := db.Exec(`UPDATE blocklist_sources SET last_synced = datetime('now') WHERE id = ?`, s.id); uerr != nil {
-					log.Printf("policy: record sync time for %s: %v", s.url, uerr)
-				}
-			}
-		} else {
-			domains, err = policy.CachedBlocklist(s.url, blDir)
-		}
-		if err != nil {
-			log.Printf("policy: blocklist %s: %v (skipped)", s.url, err)
-			continue
-		}
-		for _, p := range profs {
-			if p.OrgID == s.orgID {
-				for _, d := range domains {
-					p.Blocklists.Add(d, true) // lists block subdomains implicitly
-				}
-			}
-		}
-	}
 
 	// Exit nodes, by id. Health "down" marks an exit as unusable; anything else
 	// is usable (see exits.go).
@@ -221,6 +175,10 @@ func LoadSnapshot(db DBTX, dataDir string, fetch bool) (*policy.Snapshot, error)
 		}
 	}
 	rows.Close()
+
+	if err := loadProfileFilters(db, blDir, mode, profs, exits); err != nil {
+		return nil, err
+	}
 
 	// Endpoints (with source allowlists).
 	var eps []*policy.Endpoint
@@ -348,15 +306,25 @@ func AddEndpoint(db DBTX, org int64, name string, profileID int64, cidrs string)
 	return id, token, nil
 }
 
-// AddBlocklistSource subscribes org to a list. Re-subscribing is a no-op.
-func AddBlocklistSource(db DBTX, org int64, url, format string) error {
+// AddBlocklistSource subscribes org to a list and turns it on for every
+// profile in the org (each profile can switch it off on its Filters page).
+// Re-subscribing is a no-op. Returns the list's id.
+func AddBlocklistSource(db DBTX, org int64, url, format string) (int64, error) {
 	switch format {
 	case "hosts", "dnsmasq", "adguard":
 	default:
-		return fmt.Errorf("unknown format %q (hosts|dnsmasq|adguard)", format)
+		return 0, fmt.Errorf("unknown format %q (hosts|dnsmasq|adguard)", format)
 	}
-	_, err := db.Exec(`INSERT OR IGNORE INTO blocklist_sources (org_id, url, format) VALUES (?, ?, ?)`, org, url, format)
-	return err
+	if _, err := db.Exec(`INSERT OR IGNORE INTO blocklist_sources (org_id, url, format) VALUES (?, ?, ?)`, org, url, format); err != nil {
+		return 0, err
+	}
+	var id int64
+	if err := db.QueryRow(`SELECT id FROM blocklist_sources WHERE org_id = ? AND url = ?`, org, url).Scan(&id); err != nil {
+		return 0, err
+	}
+	_, err := db.Exec(`INSERT OR IGNORE INTO profile_filters (profile_id, kind, ref, state)
+		SELECT id, 'list', ?, 'block' FROM profiles WHERE org_id = ?`, strconv.FormatInt(id, 10), org)
+	return id, err
 }
 
 // insertedOrNotFound maps a zero-row INSERT…SELECT (the ownership check failed)
@@ -377,4 +345,126 @@ func insertedOrNotFound(res interface {
 
 func normDomain(d string) string {
 	return strings.ToLower(strings.TrimSuffix(d, "."))
+}
+
+// loadProfileFilters attaches enabled filter categories, services and custom
+// lists to each profile. Compiled lists are shared between profiles. A list
+// that cannot be loaded is skipped with a log line; the rest still apply.
+func loadProfileFilters(db DBTX, blDir string, mode policy.FetchMode, profs map[int64]*policy.Profile, exits map[int64]*policy.Exit) error {
+	type row struct {
+		profile          int64
+		kind, ref, state string
+		level            string
+		exit             int64
+	}
+	// Read everything and close the cursor before touching the network or
+	// writing: the pool has one connection, so an open cursor would deadlock.
+	var rowsOut []row
+	rows, err := db.Query(`SELECT profile_id, kind, ref, state, level, COALESCE(exit_id, 0) FROM profile_filters`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.profile, &r.kind, &r.ref, &r.state, &r.level, &r.exit); err != nil {
+			rows.Close()
+			return err
+		}
+		rowsOut = append(rowsOut, r)
+	}
+	rows.Close()
+
+	lists := map[string]string{} // blocklist id → url
+	rows, err = db.Query(`SELECT id, url FROM blocklist_sources`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id int64
+		var url string
+		if err := rows.Scan(&id, &url); err != nil {
+			rows.Close()
+			return err
+		}
+		lists[strconv.FormatInt(id, 10)] = url
+	}
+	rows.Close()
+
+	servicesLoaded := false
+	loaded := map[string]*policy.DomainSet{}
+	load := func(url string, format policy.ListFormat) *policy.DomainSet {
+		if format == "" {
+			format = policy.FormatDomains
+		}
+		if set, ok := loaded[url]; ok {
+			return set // fetch and compile each source once per load, however many profiles use it
+		}
+		set, err := policy.LoadList(url, blDir, format, mode)
+		loaded[url] = set
+		if err != nil {
+			log.Printf("policy: list %s: %v (skipped)", url, err)
+			return nil
+		}
+		return set
+	}
+
+	for _, r := range rowsOut {
+		p := profs[r.profile]
+		if p == nil {
+			continue
+		}
+		switch r.kind {
+		case "filter":
+			_, lvl := catalog.FilterByID(r.ref, r.level)
+			if lvl == nil {
+				continue
+			}
+			for _, url := range lvl.URLs {
+				if set := load(url, lvl.Format); set != nil {
+					p.Lists = append(p.Lists, policy.ListRef{Set: set, Reason: "filter:" + r.ref})
+				}
+			}
+		case "list":
+			url, ok := lists[r.ref]
+			if !ok {
+				continue
+			}
+			if set := load(url, policy.FormatDomains); set != nil {
+				p.Lists = append(p.Lists, policy.ListRef{Set: set, Reason: "list:" + r.ref})
+			}
+		case "service":
+			if !servicesLoaded {
+				if _, err := catalog.Services(blDir, mode); err != nil {
+					log.Printf("policy: %v (services skipped)", err)
+				}
+				servicesLoaded = true
+			}
+			_, set := catalog.ServiceSet(blDir, r.ref)
+			if set == nil {
+				continue
+			}
+			ref := policy.ListRef{Set: set, Reason: "service:" + r.ref}
+			switch r.state {
+			case "allow":
+				p.ServiceAllow = append(p.ServiceAllow, ref)
+			case "block":
+				p.ServiceBlock = append(p.ServiceBlock, ref)
+			case "redirect":
+				if ex := exits[r.exit]; ex != nil {
+					p.ServiceRedirect = append(p.ServiceRedirect, policy.ServiceRoute{Set: set, Reason: ref.Reason, Exit: ex})
+				}
+			}
+		}
+	}
+
+	// Record when each custom list was last downloaded, for the UI.
+	for id, url := range lists {
+		if t := policy.ListFetchedAt(url, blDir); !t.IsZero() {
+			if _, err := db.Exec(`UPDATE blocklist_sources SET last_synced = ? WHERE id = ?`,
+				t.UTC().Format(time.DateTime), id); err != nil {
+				log.Printf("policy: record sync time for %s: %v", url, err)
+			}
+		}
+	}
+	return nil
 }

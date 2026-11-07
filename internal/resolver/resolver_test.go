@@ -39,12 +39,10 @@ const (
 // Nothing here forwards upstream, so the tests need no network.
 func newTestResolver(t *testing.T) *Resolver {
 	t.Helper()
-	p1 := &policy.Profile{ID: 1, Allow: policy.NewDomainSet(), Block: policy.NewDomainSet(),
-		Blocklists: policy.NewDomainSet(), Rewrites: map[string]policy.RewriteRecord{}}
+	p1 := &policy.Profile{ID: 1, Allow: policy.NewDomainSet(), Block: policy.NewDomainSet(), Rewrites: map[string]policy.RewriteRecord{}}
 	p1.Block.Add("ads.test", false)
 
-	p2 := &policy.Profile{ID: 2, Allow: policy.NewDomainSet(), Block: policy.NewDomainSet(),
-		Blocklists: policy.NewDomainSet(), Rewrites: map[string]policy.RewriteRecord{}}
+	p2 := &policy.Profile{ID: 2, Allow: policy.NewDomainSet(), Block: policy.NewDomainSet(), Rewrites: map[string]policy.RewriteRecord{}}
 	p2.Rewrites["ads.test"] = policy.RewriteRecord{Target: "10.9.9.9"}
 
 	cidrA, err := policy.NewCidrSetFromJSON(`["10.1.0.0/16"]`)

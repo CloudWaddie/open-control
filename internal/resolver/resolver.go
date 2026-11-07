@@ -224,6 +224,12 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 				// The exit is down: resolve normally and say so in the log.
 				r.debugf("resolver: REDIRECT %s skipped, exit %s is down; forwarding", q.Name, d.ExitName)
 				fallback = "exit-down:" + d.ExitName
+			default:
+				// An explicit allow (custom rule or allowed service) is worth
+				// recording; plain "nothing matched" is not.
+				if d.Reason != "default" {
+					fallback = d.Reason
+				}
 			}
 		}
 	}

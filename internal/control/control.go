@@ -25,7 +25,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwaddie/opencontrol/internal/catalog"
 	"github.com/cloudwaddie/opencontrol/internal/egress"
+	"github.com/cloudwaddie/opencontrol/internal/policy"
 	"github.com/cloudwaddie/opencontrol/internal/store"
 	"github.com/cloudwaddie/opencontrol/internal/web"
 )
@@ -46,13 +48,14 @@ type Server struct {
 	db      *sql.DB
 	reload  func()          // asks the resolver to recompile its snapshot
 	checker *egress.Checker // probes exit nodes on demand; nil disables /check
+	dataDir string          // where list and registry downloads are cached
 }
 
 // Handler returns the API mux plus the embedded UI. reload is called after
 // every committed write so changes take effect without a restart. checker may
 // be nil, in which case the on-demand exit check endpoint reports 501.
-func Handler(db *sql.DB, reload func(), checker *egress.Checker) http.Handler {
-	s := &Server{db: db, reload: reload, checker: checker}
+func Handler(db *sql.DB, reload func(), checker *egress.Checker, dataDir string) http.Handler {
+	s := &Server{db: db, reload: reload, checker: checker, dataDir: dataDir}
 	mux := http.NewServeMux()
 
 	// Liveness + readiness: the database must answer. Unauthenticated, so
@@ -75,6 +78,11 @@ func Handler(db *sql.DB, reload func(), checker *egress.Checker) http.Handler {
 	mux.Handle("GET /api/v1/profiles/{id}/rules", s.require("viewer", s.listRules))
 	mux.Handle("POST /api/v1/profiles/{id}/rules", s.require("operator", s.createRule))
 	mux.Handle("DELETE /api/v1/rules/{id}", s.require("operator", s.deleteRule))
+	mux.Handle("GET /api/v1/profiles/{id}/filters", s.require("viewer", s.listFilters))
+	mux.Handle("PUT /api/v1/profiles/{id}/filters", s.require("operator", s.setFilter))
+
+	mux.Handle("GET /api/v1/catalog/filters", s.require("viewer", s.catalogFilters))
+	mux.Handle("GET /api/v1/catalog/services", s.require("viewer", s.catalogServices))
 
 	mux.Handle("GET /api/v1/endpoints", s.require("viewer", s.listEndpoints))
 	mux.Handle("POST /api/v1/endpoints", s.require("operator", s.createEndpoint))
@@ -298,6 +306,64 @@ func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- filters, services, lists ---
+
+func (s *Server) listFilters(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	out, err := store.ListProfileFilters(s.db, principalOf(r).org, id)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	respond(w, out, err)
+}
+
+// setFilter turns a filter category, service or custom list on, off
+// (state "off"), or changes its level, state or exit.
+func (s *Server) setFilter(w http.ResponseWriter, r *http.Request) {
+	profileID, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var in store.ProfileFilter
+	if !decode(w, r, &in) {
+		return
+	}
+	s.mutate(w, r, "filter.set", func(tx *sql.Tx, org int64) (result, error) {
+		if err := store.SetProfileFilter(tx, org, profileID, in); err != nil {
+			return result{}, err
+		}
+		target := fmt.Sprintf("profile %d: %s %s → %s", profileID, in.Kind, in.Ref, in.State)
+		if in.Level != "" {
+			target += " (" + in.Level + ")"
+		}
+		return result{target: target, status: http.StatusOK, body: in}, nil
+	})
+}
+
+func (s *Server) catalogFilters(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, catalog.Filters)
+}
+
+// catalogServices returns the app registry. The first call after install
+// downloads it; if that fails the UI shows the error.
+func (s *Server) catalogServices(w http.ResponseWriter, r *http.Request) {
+	list, err := catalog.Services(catalog.CacheDir(s.dataDir), policy.FetchMissing)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "services list unavailable: "+err.Error())
+		return
+	}
+	groups := make([]map[string]string, 0, len(catalog.Groups))
+	for _, g := range catalog.Groups {
+		groups = append(groups, map[string]string{"id": g.ID, "name": g.Name})
+	}
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	writeJSON(w, http.StatusOK, map[string]any{"groups": groups, "services": list})
+}
+
 // --- endpoints ---
 
 func (s *Server) listEndpoints(w http.ResponseWriter, r *http.Request) {
@@ -388,10 +454,11 @@ func (s *Server) createBlocklist(w http.ResponseWriter, r *http.Request) {
 		in.Format = "hosts"
 	}
 	s.mutate(w, r, "blocklist.create", func(tx *sql.Tx, org int64) (result, error) {
-		if err := store.AddBlocklistSource(tx, org, in.URL, in.Format); err != nil {
+		id, err := store.AddBlocklistSource(tx, org, in.URL, in.Format)
+		if err != nil {
 			return result{}, err
 		}
-		return result{target: in.URL, status: http.StatusCreated, body: map[string]string{"url": in.URL, "format": in.Format}}, nil
+		return result{target: in.URL, status: http.StatusCreated, body: store.Blocklist{ID: id, URL: in.URL, Format: in.Format}}, nil
 	})
 }
 

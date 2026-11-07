@@ -1,6 +1,7 @@
 package store
 
 import (
+	"github.com/cloudwaddie/opencontrol/internal/policy"
 	"path/filepath"
 	"testing"
 )
@@ -36,7 +37,7 @@ func TestEndpointTokenIsStoredHashedAndRotates(t *testing.T) {
 		t.Fatal("stored value is not the token's hash")
 	}
 
-	snap, err := LoadSnapshot(db, t.TempDir(), false)
+	snap, err := LoadSnapshot(db, t.TempDir(), policy.FetchNone)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ func TestEndpointTokenIsStoredHashedAndRotates(t *testing.T) {
 	if fresh == token {
 		t.Fatal("rotation returned the same token")
 	}
-	snap, _ = LoadSnapshot(db, t.TempDir(), false)
+	snap, _ = LoadSnapshot(db, t.TempDir(), policy.FetchNone)
 	if snap.EndpointForToken(token) != nil {
 		t.Error("old token still works after rotation")
 	}

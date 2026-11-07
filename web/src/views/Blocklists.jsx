@@ -54,7 +54,7 @@ export default function Blocklists({ me }) {
     <div className="flex flex-col gap-6">
       <PageHeader
         title="Blocklists"
-        description="Subscribed lists are cached on disk and refreshed hourly. Changes take effect after the next refresh; a SIGHUP reloads rules immediately."
+        description="Your own list subscriptions, refreshed hourly. A new list is turned on for every profile; switch it per profile on that profile's Filters tab. For common categories, use the built-in filters instead."
       />
       <ErrorLine error={error} onDismiss={() => setError('')} />
 

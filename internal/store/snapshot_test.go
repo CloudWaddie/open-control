@@ -44,7 +44,7 @@ func TestTenantsEnforceSeparately(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snap, err := LoadSnapshot(db, t.TempDir(), false)
+	snap, err := LoadSnapshot(db, t.TempDir(), policy.FetchNone)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestSnapshotDecisions(t *testing.T) {
 		}
 	}
 
-	snap, err := LoadSnapshot(db, t.TempDir(), false) // no network in tests
+	snap, err := LoadSnapshot(db, t.TempDir(), policy.FetchNone) // no network in tests
 	if err != nil {
 		t.Fatal(err)
 	}
