@@ -1,0 +1,83 @@
+# Runs the tests, starts the server with sample data and screenshots the UI.
+# This workflow runs the PR's code, so it gets a read-only token and no
+# secrets. It only uploads an artifact; "PR preview comment" posts the result.
+name: PR preview
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OC_LISTEN: 127.0.0.1:15353
+      OC_API_LISTEN: 127.0.0.1:8080
+      OC_SQLITE_PATH: ${{ github.workspace }}/run/oc.db
+      OC_DATA_DIR: ${{ github.workspace }}/run
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: .github/pr-preview/package-lock.json
+
+      - name: Record PR
+        run: |
+          mkdir -p out/shots
+          printf '{"pr":%s,"sha":"%s"}\n' "${{ github.event.pull_request.number }}" "${{ github.event.pull_request.head.sha }}" > out/meta.json
+
+      - name: Go tests
+        id: tests
+        run: |
+          set +e
+          go test -json ./... > out/test.json 2> out/test-stderr.txt
+          echo $? > out/test-exit
+          exit 0
+
+      - name: Start server
+        id: server
+        run: |
+          go build -o oc ./cmd/opencontrol
+          ./oc migrate
+          TOKEN=$(./oc addtoken preview admin | tail -1)
+          echo "::add-mask::$TOKEN"
+          echo "OC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          nohup ./oc serve > out/server.log 2>&1 &
+          for i in $(seq 1 30); do ./oc healthcheck && exit 0; sleep 1; done
+          echo "server did not become healthy"; cat out/server.log; exit 1
+
+      - name: Screenshots
+        id: shots
+        if: steps.server.outcome == 'success'
+        continue-on-error: true
+        working-directory: .github/pr-preview
+        env:
+          OC_API: http://127.0.0.1:8080
+          OC_DNS: 127.0.0.1:15353
+          OUT: ${{ github.workspace }}/out/shots
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          node preview.mjs 2>&1 | tee ../../out/preview.log
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: pr-preview
+          path: out
+          retention-days: 7
+
+      - name: Fail on test failures
+        run: test "$(cat out/test-exit)" = 0

@@ -1,0 +1,165 @@
+# Posts the "PR preview" result on the pull request. Runs from the default
+# branch with write access, and never executes code from the PR: it only reads
+# the artifact, treating every file in it as untrusted data.
+name: PR preview comment
+
+on:
+  workflow_run:
+    workflows: ["PR preview"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: pr-preview-comment
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: pr-preview
+          path: preview
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # The PR number in the artifact is only trusted if that PR's head is the
+      # commit this run tested.
+      - name: Find the pull request
+        id: pr
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const run = context.payload.workflow_run;
+            const meta = JSON.parse(fs.readFileSync('preview/meta.json', 'utf8'));
+            const number = Number(meta.pr);
+            if (!Number.isInteger(number) || number <= 0) throw new Error('bad PR number in artifact');
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
+            if (pr.head.sha !== run.head_sha) {
+              core.notice(`PR #${number} has moved on from ${run.head_sha}; skipping the stale preview.`);
+              return;
+            }
+            core.setOutput('number', String(number));
+            core.setOutput('sha', run.head_sha);
+
+      - name: Publish screenshots
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ steps.pr.outputs.sha }}
+        run: |
+          set -euo pipefail
+          dest="pr-$PR/${SHA:0:7}"
+          git init -q previews
+          cd previews
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          for attempt in 1 2 3 4 5; do
+            if git fetch -q --depth 1 origin pr-previews; then
+              git checkout -q -B pr-previews FETCH_HEAD
+            else
+              git checkout -q --orphan pr-previews
+              git rm -rqf . 2>/dev/null || true
+              printf 'Screenshots posted on pull requests by the PR preview workflow.\n' > README.md
+            fi
+            mkdir -p "$dest"
+            # Copy only plain PNG names; everything else in the artifact is ignored.
+            for f in ../preview/shots/*.png; do
+              [ -e "$f" ] || continue
+              name=$(basename "$f")
+              [[ "$name" =~ ^[a-z0-9-]+\.png$ ]] || continue
+              cp "$f" "$dest/$name"
+            done
+            git add -A
+            git diff --cached --quiet && break
+            git commit -qm "PR #$PR at ${SHA:0:7}"
+            git push -q origin pr-previews && break
+            echo "push raced another preview, retrying ($attempt)"
+            sleep $((attempt * 2))
+          done
+
+      - name: Comment
+        if: steps.pr.outputs.number != ''
+        uses: actions/github-script@v8
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+          SHA: ${{ steps.pr.outputs.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- opencontrol-pr-preview -->';
+            const pr = Number(process.env.PR);
+            const sha = process.env.SHA;
+            const read = (p) => (fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '');
+            // Untrusted text goes into fenced blocks with backticks removed.
+            const fence = (s) => '```\n' + s.replace(/`/g, "'").slice(-4000) + '\n```';
+            const runURL = context.payload.workflow_run.html_url;
+
+            // Tests, from `go test -json`.
+            const results = { pass: [], fail: [], skip: [] };
+            for (const line of read('preview/test.json').split('\n')) {
+              let e;
+              try { e = JSON.parse(line); } catch { continue; }
+              if (e.Test && ['pass', 'fail', 'skip'].includes(e.Action)) results[e.Action].push(`${e.Package.split('/').pop()}: ${e.Test}`);
+            }
+            const exit = read('preview/test-exit').trim();
+            const testsOK = exit === '0';
+            const buildBroken = !testsOK && results.fail.length === 0;
+
+            // Screenshots.
+            let shots = { shots: [], errors: [] };
+            try { shots = JSON.parse(read('preview/shots/shots.json')); } catch {}
+            const safe = (f) => /^[a-z0-9-]+\.png$/.test(f);
+            const base = `https://github.com/${context.repo.owner}/${context.repo.repo}/blob/pr-previews/pr-${pr}/${sha.slice(0, 7)}`;
+            const img = (f, w) => (f && safe(f) ? `<a href="${base}/${f}"><img src="${base}/${f}?raw=true" width="${w}"></a>` : '');
+            const byPage = new Map();
+            for (const s of shots.shots || []) {
+              if (!safe(s.file)) continue;
+              const key = String(s.page).replace(/[^a-z0-9-]/g, '');
+              if (!byPage.has(key)) byPage.set(key, {});
+              byPage.get(key)[String(s.variant)] = s.file;
+            }
+
+            const lines = [marker];
+            const icon = testsOK && (shots.errors || []).length === 0 && byPage.size > 0 ? '✅' : '⚠️';
+            lines.push(`## ${icon} Preview of ${sha.slice(0, 7)}`, '');
+            if (testsOK) {
+              lines.push(`**Tests:** ${results.pass.length} passed${results.skip.length ? `, ${results.skip.length} skipped` : ''}.`);
+            } else if (buildBroken) {
+              lines.push('**Tests:** did not run (build or vet error).', '', fence(read('preview/test-stderr.txt') || 'no output'));
+            } else {
+              lines.push(`**Tests:** ${results.fail.length} failed, ${results.pass.length} passed.`, '');
+              for (const t of results.fail.slice(0, 20)) lines.push(`- \`${t.replace(/`/g, '')}\``);
+              if (results.fail.length > 20) lines.push(`- …and ${results.fail.length - 20} more`);
+            }
+            lines.push('');
+
+            if (byPage.size === 0) {
+              lines.push('**Screenshots:** none. The server or the screenshot script failed; see the run log.', '', fence(read('preview/preview.log') || read('preview/server.log') || 'no output'));
+            } else {
+              const errs = shots.errors || [];
+              lines.push(`**Browser console:** ${errs.length ? `${errs.length} error(s)` : 'no errors'}.`);
+              if (errs.length) lines.push('', fence(errs.slice(0, 15).join('\n')));
+              lines.push('', '<details open><summary>Screenshots</summary>', '');
+              lines.push('| Page | Light | Dark | Mobile |', '| --- | --- | --- | --- |');
+              for (const [page, v] of byPage) {
+                lines.push(`| ${page} | ${img(v.desktop, 260)} | ${img(v.dark, 260)} | ${img(v.mobile, 90)} |`);
+              }
+              lines.push('', '</details>');
+            }
+            lines.push('', `<sub>[Run log](${runURL}) · sample data is seeded fresh on every run</sub>`);
+            const body = lines.join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: pr, per_page: 100 });
+            const mine = comments.find((c) => c.user.type === 'Bot' && c.body.includes(marker));
+            if (mine) await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number: pr, body });

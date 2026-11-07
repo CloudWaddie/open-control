@@ -20,3 +20,6 @@ nul
 
 # Frontend
 web/node_modules/
+
+# PR preview bot
+.github/pr-preview/node_modules/
