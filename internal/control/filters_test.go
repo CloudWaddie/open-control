@@ -10,21 +10,21 @@ import (
 func TestFilterLifecycle(t *testing.T) {
 	f := newFixture(t)
 
-	code, _, _ := f.do("PUT", "/api/v1/profiles/1/filters", f.operator, `{"kind":"filter","ref":"ads","state":"block","level":"pro"}`)
+	code, _, _ := f.do("PUT", "/api/v1/profiles/1/filters", f.operator, `{"kind":"filter","ref":"ads","state":"block","level":"strict"}`)
 	if code != http.StatusOK {
 		t.Fatalf("enable filter: %d", code)
 	}
 	f.waitReload()
 
 	// Changing the level updates the same row.
-	if code, _, _ := f.do("PUT", "/api/v1/profiles/1/filters", f.operator, `{"kind":"filter","ref":"ads","state":"block","level":"light"}`); code != http.StatusOK {
+	if code, _, _ := f.do("PUT", "/api/v1/profiles/1/filters", f.operator, `{"kind":"filter","ref":"ads","state":"block","level":"relaxed"}`); code != http.StatusOK {
 		t.Fatalf("change level: %d", code)
 	}
 	f.waitReload()
 	_, _, raw := f.do("GET", "/api/v1/profiles/1/filters", f.viewer, "")
 	var got []map[string]any
 	_ = json.Unmarshal(raw, &got)
-	if len(got) != 1 || got[0]["level"] != "light" {
+	if len(got) != 1 || got[0]["level"] != "relaxed" {
 		t.Fatalf("filters after level change: %s", raw)
 	}
 

@@ -43,14 +43,15 @@ func SeedDefaults(db DBTX) error {
 	}
 	profileID, _ := res.LastInsertId()
 
-	// The seeded endpoint gets an unknown random token: it is reached by source
-	// IP, and nobody holds a token for it. Rotate to issue one.
+	// The seeded endpoint is reached by source IP; it also gets a token (now
+	// viewable on the endpoints page) so devices can use encrypted DNS against
+	// the default profile out of the box.
 	secret, err := NewSecret()
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, name, allowed_source_ips) VALUES (?, ?, ?, 'default', '["0.0.0.0/0"]')`,
-		orgID, profileID, HashToken(secret))
+	_, err = db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, token_plain, name, allowed_source_ips) VALUES (?, ?, ?, ?, 'default', '["0.0.0.0/0"]')`,
+		orgID, profileID, HashToken(secret), secret)
 	if err != nil {
 		return err
 	}
@@ -103,16 +104,19 @@ func LoadSnapshot(db DBTX, dataDir string, mode policy.FetchMode) (*policy.Snaps
 
 	// Profiles
 	profs := map[int64]*policy.Profile{}
-	rows, err := db.Query(`SELECT id, org_id, name FROM profiles`)
+	rows, err := db.Query(`SELECT id, org_id, name, options FROM profiles`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var p policy.Profile
-		if err := rows.Scan(&p.ID, &p.OrgID, &p.Name); err != nil {
+		var opts string
+		if err := rows.Scan(&p.ID, &p.OrgID, &p.Name, &opts); err != nil {
 			rows.Close()
 			return nil, err
 		}
+		p.Options = parseOptions(opts)
+		p.Upstreams, _ = p.Options.Upstreams()
 		p.Allow = policy.NewDomainSet()
 		p.Block = policy.NewDomainSet()
 		p.Rewrites = map[string]policy.RewriteRecord{}
@@ -125,14 +129,14 @@ func LoadSnapshot(db DBTX, dataDir string, mode policy.FetchMode) (*policy.Snaps
 	// Exit nodes, by id. Health "down" marks an exit as unusable; anything else
 	// is usable (see exits.go).
 	exits := map[int64]*policy.Exit{}
-	rows, err = db.Query(`SELECT id, name, answer_ip, health FROM exit_nodes`)
+	rows, err = db.Query(`SELECT id, name, answer_ip, answer_ipv6, health FROM exit_nodes`)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var e policy.Exit
 		var health string
-		if err := rows.Scan(&e.ID, &e.Name, &e.AnswerIP, &health); err != nil {
+		if err := rows.Scan(&e.ID, &e.Name, &e.AnswerIP, &e.AnswerIPv6, &health); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -204,7 +208,13 @@ func LoadSnapshot(db DBTX, dataDir string, mode policy.FetchMode) (*policy.Snaps
 	}
 	rows.Close()
 
-	return policy.NewSnapshot(eps, profs), nil
+	snap := policy.NewSnapshot(eps, profs)
+	// Clients that match no endpoint use the first org's default profile.
+	var def sql.NullInt64
+	if err := db.QueryRow(`SELECT default_profile_id FROM orgs ORDER BY id LIMIT 1`).Scan(&def); err == nil && def.Valid {
+		snap.SetDefault(def.Int64)
+	}
+	return snap, nil
 }
 
 // AddRule inserts a rule into one of org's profiles. pattern is the domain (or
@@ -228,6 +238,9 @@ func AddRule(db DBTX, org, profileID int64, kind, matcher, pattern, answer strin
 	}
 	if kind == "rewrite" && (matcher != "domain" || answer == "") {
 		return 0, fmt.Errorf("rewrite needs an exact domain and an answer (IP or name)")
+	}
+	if err := checkUnlocked(db, profileID); err != nil {
+		return 0, err
 	}
 	if kind == "redirect" {
 		// For redirect rules, answer holds the exit node id. It must be one of
@@ -264,7 +277,27 @@ func AddProfile(db DBTX, org int64, name string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	_, err = db.Exec(`UPDATE orgs SET default_profile_id = ? WHERE id = ? AND default_profile_id IS NULL`, id, org)
+	return id, err
+}
+
+// AddProfileWithEndpoint creates a profile plus an encrypted-only endpoint of
+// the same name, so every profile has its own DoH/DoT address. The endpoint
+// token is returned once.
+func AddProfileWithEndpoint(db DBTX, org int64, name string) (int64, int64, string, error) {
+	id, err := AddProfile(db, org, name)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	epID, token, err := AddEndpoint(db, org, name, id, "")
+	if err != nil {
+		return 0, 0, "", err
+	}
+	return id, epID, token, nil
 }
 
 // AddEndpoint creates an endpoint in org bound to one of org's profiles,
@@ -277,8 +310,10 @@ func AddEndpoint(db DBTX, org int64, name string, profileID int64, cidrs string)
 			list = append(list, c)
 		}
 	}
-	if len(list) == 0 {
-		return 0, "", fmt.Errorf("endpoint needs at least one CIDR (fail closed otherwise)")
+	// No CIDRs means an encrypted-only endpoint: reachable by its DoH/DoT
+	// token, never by source address (an empty allowlist matches nothing).
+	if list == nil {
+		list = []string{}
 	}
 	raw, err := json.Marshal(list)
 	if err != nil {
@@ -292,10 +327,12 @@ func AddEndpoint(db DBTX, org int64, name string, profileID int64, cidrs string)
 		return 0, "", err
 	}
 	token := hex.EncodeToString(buf)
-	// Only the hash is stored; the plaintext is returned once to the caller.
-	res, err := db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, name, allowed_source_ips)
-		SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM profiles WHERE id = ? AND org_id = ?)`,
-		org, profileID, HashToken(token), name, string(raw), profileID, org)
+	// The token is stored twice: hashed for lookup, plaintext for the pages
+	// that show it again (endpoint tokens are device identifiers, not
+	// credentials).
+	res, err := db.Exec(`INSERT INTO endpoints (org_id, profile_id, token, token_plain, name, allowed_source_ips)
+		SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM profiles WHERE id = ? AND org_id = ?)`,
+		org, profileID, HashToken(token), token, name, string(raw), profileID, org)
 	if err != nil {
 		return 0, "", err
 	}
@@ -306,10 +343,15 @@ func AddEndpoint(db DBTX, org int64, name string, profileID int64, cidrs string)
 	return id, token, nil
 }
 
-// AddBlocklistSource subscribes org to a list and turns it on for every
-// profile in the org (each profile can switch it off on its Filters page).
-// Re-subscribing is a no-op. Returns the list's id.
-func AddBlocklistSource(db DBTX, org int64, url, format string) (int64, error) {
+// AddBlocklistSource subscribes org to a list and turns it on for one profile
+// (profileID > 0) or for every profile in the org (0). Re-subscribing is a
+// no-op apart from enabling it. Returns the list's id.
+func AddBlocklistSource(db DBTX, org int64, url, format string, profileID int64) (int64, error) {
+	if profileID > 0 {
+		if err := profileInOrg(db, org, profileID); err != nil {
+			return 0, err
+		}
+	}
 	switch format {
 	case "hosts", "dnsmasq", "adguard":
 	default:
@@ -323,7 +365,8 @@ func AddBlocklistSource(db DBTX, org int64, url, format string) (int64, error) {
 		return 0, err
 	}
 	_, err := db.Exec(`INSERT OR IGNORE INTO profile_filters (profile_id, kind, ref, state)
-		SELECT id, 'list', ?, 'block' FROM profiles WHERE org_id = ?`, strconv.FormatInt(id, 10), org)
+		SELECT id, 'list', ?, 'block' FROM profiles WHERE org_id = ? AND (? = 0 OR id = ?)`,
+		strconv.FormatInt(id, 10), org, profileID, profileID)
 	return id, err
 }
 
@@ -391,8 +434,8 @@ func loadProfileFilters(db DBTX, blDir string, mode policy.FetchMode, profs map[
 	rows.Close()
 
 	servicesLoaded := false
-	loaded := map[string]*policy.DomainSet{}
-	load := func(url string, format policy.ListFormat) *policy.DomainSet {
+	loaded := map[string]*policy.HashSet{}
+	load := func(url string, format policy.ListFormat) *policy.HashSet {
 		if format == "" {
 			format = policy.FormatDomains
 		}

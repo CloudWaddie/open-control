@@ -166,7 +166,7 @@ func TestValidation(t *testing.T) {
 		{"rewrite without answer", "POST", "/api/v1/profiles/1/rules", `{"kind":"rewrite","matcher":"domain","pattern":"x.example"}`, 400},
 		{"unknown JSON field", "POST", "/api/v1/profiles/1/rules", `{"kind":"block","matcher":"domain","pattern":"x.example","bogus":1}`, 400},
 		{"bad profile id", "POST", "/api/v1/profiles/abc/rules", `{}`, 400},
-		{"endpoint without CIDRs", "POST", "/api/v1/endpoints", `{"name":"e","profile_id":1,"cidrs":[]}`, 400},
+		{"endpoint without CIDRs is encrypted-only", "POST", "/api/v1/endpoints", `{"name":"e","profile_id":1,"cidrs":[]}`, 201},
 		{"endpoint bad CIDR", "POST", "/api/v1/endpoints", `{"name":"e","profile_id":1,"cidrs":["not-a-cidr"]}`, 400},
 		{"blocklist not a URL", "POST", "/api/v1/blocklists", `{"url":"file:///etc/passwd"}`, 400},
 		{"token unknown role", "POST", "/api/v1/tokens", `{"name":"t","role":"god"}`, 400},

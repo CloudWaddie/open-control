@@ -29,8 +29,10 @@ type DBTX interface {
 var ErrNotFound = errors.New("not found")
 
 type Profile struct {
-	ID   int64  `json:"id"`
-	Name string `json:"name"`
+	ID      int64  `json:"id"`
+	Name    string `json:"name"`
+	Default bool   `json:"default"`
+	Locked  bool   `json:"locked"`
 }
 
 type Rule struct {
@@ -75,7 +77,8 @@ type Token struct {
 }
 
 func ListProfiles(db DBTX, org int64) ([]Profile, error) {
-	rows, err := db.Query(`SELECT id, name FROM profiles WHERE org_id = ? ORDER BY id`, org)
+	rows, err := db.Query(`SELECT p.id, p.name, p.options, COALESCE(o.default_profile_id = p.id, 0)
+		FROM profiles p JOIN orgs o ON o.id = p.org_id WHERE p.org_id = ? ORDER BY p.id`, org)
 	if err != nil {
 		return nil, err
 	}
@@ -83,9 +86,11 @@ func ListProfiles(db DBTX, org int64) ([]Profile, error) {
 	out := []Profile{}
 	for rows.Next() {
 		var p Profile
-		if err := rows.Scan(&p.ID, &p.Name); err != nil {
+		var opts string
+		if err := rows.Scan(&p.ID, &p.Name, &opts, &p.Default); err != nil {
 			return nil, err
 		}
+		p.Locked = parseOptions(opts).Locked
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -112,6 +117,12 @@ func ListRules(db DBTX, org, profileID int64) ([]Rule, error) {
 }
 
 func DeleteRule(db DBTX, org, id int64) error {
+	var profileID int64
+	if err := db.QueryRow(`SELECT profile_id FROM profile_rules WHERE id = ?`, id).Scan(&profileID); err == nil {
+		if err := checkUnlocked(db, profileID); err != nil {
+			return err
+		}
+	}
 	return deleteRow(db, `DELETE FROM profile_rules WHERE id = ?
 		AND profile_id IN (SELECT id FROM profiles WHERE org_id = ?)`, id, org)
 }
@@ -210,18 +221,30 @@ func NewSecret() (string, error) {
 }
 
 // RotateEndpointToken replaces an endpoint's token. The old token stops working
-// immediately; the new plaintext is returned once.
+// immediately; the new one is returned and, like every endpoint token, can be
+// viewed again on the endpoints page.
 func RotateEndpointToken(db DBTX, org, id int64) (string, error) {
 	token, err := NewSecret()
 	if err != nil {
 		return "", err
 	}
 	// deleteRow reports ErrNotFound when no row matched (wrong id or org).
-	if err := deleteRow(db, `UPDATE endpoints SET token = ? WHERE id = ? AND org_id = ?`,
-		HashToken(token), id, org); err != nil {
+	if err := deleteRow(db, `UPDATE endpoints SET token = ?, token_plain = ? WHERE id = ? AND org_id = ?`,
+		HashToken(token), token, id, org); err != nil {
 		return "", err
 	}
 	return token, nil
+}
+
+// GetEndpointToken returns an endpoint's current DoH/DoT token. Endpoints
+// created before tokens were viewable have none; rotating issues one.
+func GetEndpointToken(db DBTX, org, id int64) (string, error) {
+	var token string
+	err := db.QueryRow(`SELECT token_plain FROM endpoints WHERE id = ? AND org_id = ?`, id, org).Scan(&token)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("endpoint %d: %w", id, ErrNotFound)
+	}
+	return token, err
 }
 
 // CreateToken mints a random token for org with a role. The plaintext is

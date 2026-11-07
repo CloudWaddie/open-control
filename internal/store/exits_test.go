@@ -39,18 +39,18 @@ func TestExitValidation(t *testing.T) {
 		{"socks5", "vps.example:1080", "not-an-ip"},
 	}
 	for _, b := range bad {
-		if _, err := AddExitNode(db, org, "x", b.kind, b.addr, b.ans); err == nil {
+		if _, err := AddExitNode(db, org, "x", ExitSpec{Kind: b.kind, Address: b.addr, AnswerIP: b.ans}); err == nil {
 			t.Errorf("accepted bad exit %+v", b)
 		}
 	}
-	if _, err := AddExitNode(db, org, "vps", "socks5", "vps.example:1080", "10.77.0.1"); err != nil {
+	if _, err := AddExitNode(db, org, "vps", ExitSpec{Kind: "socks5", Address: "vps.example:1080", AnswerIP: "10.77.0.1"}); err != nil {
 		t.Errorf("valid exit refused: %v", err)
 	}
 }
 
 func TestRedirectRulesStayInTheirOrg(t *testing.T) {
 	db, orgA, orgB := exitsDB(t)
-	exitB, err := AddExitNode(db, orgB, "b-vps", "socks5", "b.example:1080", "10.88.0.1")
+	exitB, err := AddExitNode(db, orgB, "b-vps", ExitSpec{Kind: "socks5", Address: "b.example:1080", AnswerIP: "10.88.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestRedirectRulesStayInTheirOrg(t *testing.T) {
 	if _, err := AddRule(db, orgA, 1, "redirect", "wildcard", "netflix.test", strconv.FormatInt(exitB, 10)); err == nil {
 		t.Fatal("org A redirected to org B's exit")
 	}
-	exitA, _ := AddExitNode(db, orgA, "a-vps", "socks5", "a.example:1080", "10.77.0.1")
+	exitA, _ := AddExitNode(db, orgA, "a-vps", ExitSpec{Kind: "socks5", Address: "a.example:1080", AnswerIP: "10.77.0.1"})
 	if _, err := AddRule(db, orgA, 1, "redirect", "wildcard", "netflix.test", strconv.FormatInt(exitA, 10)); err != nil {
 		t.Fatalf("own exit refused: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestRedirectRulesStayInTheirOrg(t *testing.T) {
 
 func TestRedirectReachesSnapshotAndHealthFollows(t *testing.T) {
 	db, orgA, _ := exitsDB(t)
-	exitA, _ := AddExitNode(db, orgA, "a-vps", "socks5", "a.example:1080", "10.77.0.1")
+	exitA, _ := AddExitNode(db, orgA, "a-vps", ExitSpec{Kind: "socks5", Address: "a.example:1080", AnswerIP: "10.77.0.1"})
 	if _, err := AddRule(db, orgA, 1, "redirect", "wildcard", "netflix.test", strconv.FormatInt(exitA, 10)); err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestRedirectReachesSnapshotAndHealthFollows(t *testing.T) {
 
 func TestDeletingAnExitRemovesItsRedirects(t *testing.T) {
 	db, orgA, _ := exitsDB(t)
-	exitA, _ := AddExitNode(db, orgA, "a-vps", "socks5", "a.example:1080", "10.77.0.1")
+	exitA, _ := AddExitNode(db, orgA, "a-vps", ExitSpec{Kind: "socks5", Address: "a.example:1080", AnswerIP: "10.77.0.1"})
 	if _, err := AddRule(db, orgA, 1, "redirect", "domain", "netflix.test", strconv.FormatInt(exitA, 10)); err != nil {
 		t.Fatal(err)
 	}

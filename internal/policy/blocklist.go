@@ -49,7 +49,7 @@ var listClient = &http.Client{Timeout: 90 * time.Second}
 type compiledList struct {
 	size    int64
 	modTime time.Time
-	set     *domainSet
+	set     *HashSet
 }
 
 var (
@@ -61,7 +61,7 @@ var (
 // LoadList returns the compiled set for url, downloading it first according to
 // mode. When a download fails the last good copy is used; with no copy at all
 // an error is returned.
-func LoadList(url, dir string, format ListFormat, mode FetchMode) (*DomainSet, error) {
+func LoadList(url, dir string, format ListFormat, mode FetchMode) (*HashSet, error) {
 	path, err := FetchFile(url, dir, mode)
 	if err != nil {
 		return nil, err
@@ -178,8 +178,8 @@ func download(url, path string) error {
 	return nil
 }
 
-func parseList(r io.Reader, format ListFormat) *domainSet {
-	set := NewDomainSet()
+func parseList(r io.Reader, format ListFormat) *HashSet {
+	var hashes []uint64
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {
@@ -187,15 +187,15 @@ func parseList(r io.Reader, format ListFormat) *domainSet {
 		if format == FormatTLDs {
 			tld := strings.ToLower(strings.Trim(string(line), "."))
 			if tld != "" && tld[0] != '#' && !strings.ContainsAny(tld, ". \t") {
-				set.Add("."+tld, true)
+				hashes = append(hashes, fnv64("."+tld))
 			}
 			continue
 		}
 		if d := parseLine(string(line)); d != "" {
-			set.Add(d, true) // lists block subdomains implicitly
+			hashes = append(hashes, fnv64(d)) // lists block subdomains implicitly
 		}
 	}
-	return set
+	return newHashSet(hashes)
 }
 
 // parseDomains extracts blockable entries from any line-oriented list.

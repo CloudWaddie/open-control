@@ -4,7 +4,6 @@ import {
   ChevronsUpDownIcon,
   GaugeIcon,
   KeyRoundIcon,
-  ListXIcon,
   LogOutIcon,
   MonitorIcon,
   MoonIcon,
@@ -12,6 +11,7 @@ import {
   ScrollTextIcon,
   ShieldIcon,
   SunIcon,
+  UserRoundIcon,
   WaypointsIcon,
 } from 'lucide-react';
 import { api, can, getToken, setToken } from './api.js';
@@ -54,7 +54,7 @@ import Exits from './views/Exits.jsx';
 import Logs from './views/Logs.jsx';
 import Profiles from './views/Profiles.jsx';
 import Endpoints from './views/Endpoints.jsx';
-import Blocklists from './views/Blocklists.jsx';
+import Accounts from './views/Accounts.jsx';
 import Tokens from './views/Tokens.jsx';
 import Audit from './views/Audit.jsx';
 
@@ -73,13 +73,13 @@ const NAV = [
     items: [
       { id: 'profiles', label: 'Profiles', icon: ShieldIcon, min: 'viewer', view: Profiles },
       { id: 'endpoints', label: 'Endpoints', icon: NetworkIcon, min: 'viewer', view: Endpoints },
-      { id: 'blocklists', label: 'Blocklists', icon: ListXIcon, min: 'viewer', view: Blocklists },
       { id: 'exits', label: 'Exit nodes', icon: WaypointsIcon, min: 'viewer', view: Exits },
     ],
   },
   {
     label: 'Admin',
     items: [
+      { id: 'accounts', label: 'Accounts', icon: UserRoundIcon, min: 'admin', view: Accounts },
       { id: 'tokens', label: 'API tokens', icon: KeyRoundIcon, min: 'admin', view: Tokens },
       { id: 'audit', label: 'Audit log', icon: ScrollTextIcon, min: 'admin', view: Audit },
     ],
@@ -261,16 +261,25 @@ function AppSidebar({ groups, active, me, theme, setTheme, onSignOut }) {
 }
 
 function Login({ onSignedIn }) {
-  const [token, setTokenInput] = useState('');
+  const [mode, setMode] = useState('account'); // account | token
+  const [form, setForm] = useState({ username: '', password: '' });
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
-  async function submit(e) {
+  async function signIn(e) {
     e.preventDefault();
     setBusy(true);
     setError('');
-    setToken(token.trim());
     try {
+      let token = form.token;
+      if (mode === 'account') {
+        const res = await api('POST', '/auth/login', {
+          username: form.username.trim(),
+          password: form.password,
+        });
+        token = res.token;
+      }
+      setToken(token.trim());
       onSignedIn(await api('GET', '/whoami'));
     } catch (err) {
       setToken('');
@@ -289,39 +298,78 @@ function Login({ onSignedIn }) {
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle>Sign in</CardTitle>
-          <CardDescription>
-            Paste an API token. Mint one on the server with{' '}
-            <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
-              opencontrol addtoken
-            </code>
-            .
-          </CardDescription>
+          <CardDescription className="sr-only">Sign in with an account or an API token.</CardDescription>
         </CardHeader>
         <CardContent>
-          <form onSubmit={submit}>
+          <form onSubmit={signIn}>
             <FieldGroup>
-              <Field data-invalid={!!error || undefined}>
-                <FieldLabel htmlFor="token">API token</FieldLabel>
-                <Input
-                  id="token"
-                  type="password"
-                  autoFocus
-                  autoComplete="off"
-                  placeholder="oc_…"
-                  className="font-mono"
-                  aria-invalid={!!error || undefined}
-                  value={token}
-                  onChange={(e) => setTokenInput(e.target.value)}
-                />
-                {error && <FieldError>{error}</FieldError>}
-              </Field>
-              <Button type="submit" size="lg" disabled={busy || !token.trim()}>
+              {mode === 'account' ? (
+                <>
+                  <Field data-invalid={!!error || undefined}>
+                    <FieldLabel htmlFor="username">Username</FieldLabel>
+                    <Input
+                      id="username"
+                      autoFocus
+                      autoComplete="username"
+                      aria-invalid={!!error || undefined}
+                      value={form.username}
+                      onChange={(e) => setForm({ ...form, username: e.target.value })}
+                    />
+                    {error && <FieldError>{error}</FieldError>}
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="password">Password</FieldLabel>
+                    <Input
+                      id="password"
+                      type="password"
+                      autoComplete="current-password"
+                      aria-invalid={!!error || undefined}
+                      value={form.password}
+                      onChange={(e) => setForm({ ...form, password: e.target.value })}
+                    />
+                  </Field>
+                </>
+              ) : (
+                <Field data-invalid={!!error || undefined}>
+                  <FieldLabel htmlFor="token">API token</FieldLabel>
+                  <Input
+                    id="token"
+                    type="password"
+                    autoFocus
+                    autoComplete="off"
+                    placeholder="oc_…"
+                    className="font-mono"
+                    aria-invalid={!!error || undefined}
+                    onChange={(e) => setForm({ ...form, token: e.target.value })}
+                  />
+                  {error && <FieldError>{error}</FieldError>}
+                </Field>
+              )}
+              <Button type="submit" size="lg" disabled={busy}>
                 {busy ? 'Checking…' : 'Sign in'}
               </Button>
             </FieldGroup>
           </form>
+          <Button
+            variant="link"
+            size="sm"
+            className="mt-1 h-auto text-muted-foreground"
+            onClick={() => {
+              setMode(mode === 'account' ? 'token' : 'account');
+              setError('');
+            }}
+          >
+            {mode === 'account' ? 'Sign in with an API token instead' : 'Sign in with an account instead'}
+          </Button>
         </CardContent>
       </Card>
+      <p className="text-xs text-muted-foreground">
+        No account yet? Create one on the server with{' '}
+        <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs text-foreground">
+          opencontrol adduser
+        </code>
+        .
+      </p>
     </div>
   );
 }
