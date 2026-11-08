@@ -77,6 +77,12 @@ func (r *Resolver) SetSnapshot(s *policy.Snapshot) {
 	r.snapshot.Store(s)
 }
 
+// Snapshot returns the current compiled policy snapshot, for tools that need
+// to answer "what would this profile do" replaying the serving state.
+func (r *Resolver) Snapshot() *policy.Snapshot {
+	return r.snapshot.Load()
+}
+
 // SetRecorder installs the query-log sink. Without one, decisions are not logged.
 func (r *Resolver) SetRecorder(rec Recorder) {
 	r.recorder.Store(&rec)
@@ -167,8 +173,8 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 	}
 
 	// Policy (M1/M3): identify the endpoint → profile → decision.
+	var prof *policy.Profile
 	if snap := r.snapshot.Load(); snap != nil {
-		var prof *policy.Profile
 		if c.token != "" {
 			ep := snap.EndpointForToken(c.token)
 			if ep == nil {
@@ -205,26 +211,29 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 		}
 		if prof != nil {
 			v.org = prof.OrgID
-			d := snap.Evaluate(prof, q.Name)
+			d := snap.EvaluateQuery(prof, q.Name, q.Qtype, time.Now())
 			switch d.Action {
 			case policy.ActionBlock:
 				r.debugf("resolver: BLOCK %s (%s) via %s", q.Name, d.Reason, c.addr)
 				v.action, v.reason = "block", d.Reason
-				return refusal(req, dns.RcodeNameError)
+				return blockReply(prof, req, q)
 			case policy.ActionRewrite:
 				r.debugf("resolver: REWRITE %s -> %s via %s", q.Name, d.Target, c.addr)
 				v.action, v.reason = "rewrite", d.Target
-				return rewriteReply(req, q, d.Target)
+				return rewriteReply(req, q, d.Target, prof.Options.TTLRedirect())
 			case policy.ActionRedirect:
 				if d.ExitHealthy {
 					r.debugf("resolver: REDIRECT %s → exit %s (%s) via %s", q.Name, d.ExitName, d.Target, c.addr)
 					v.action, v.reason = "redirect", d.ExitName
-					return redirectReply(req, q, d.Target)
+					return redirectReply(req, q, d.Target, d.ExitIPv6, prof.Options)
 				}
 				// The exit is down: resolve normally and say so in the log.
 				r.debugf("resolver: REDIRECT %s skipped, exit %s is down; forwarding", q.Name, d.ExitName)
 				fallback = "exit-down:" + d.ExitName
 			default:
+				if d.Reason == "paused" {
+					r.debugf("resolver: filtering paused via %s", c.addr)
+				}
 				// An explicit allow (custom rule or allowed service) is worth
 				// recording; plain "nothing matched" is not.
 				if d.Reason != "default" {
@@ -234,8 +243,15 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 		}
 	}
 
-	// Cache: serve the response if we still have it.
-	if msg := r.cache.Get(key, req.Id); msg != nil {
+	// Cache: serve the response if we still have it. A profile whose options
+	// change what the answer looks like (custom upstreams, DNS64, rebind
+	// strip, TTL caps…) gets its own cache/singleflight namespace so its
+	// processed answers never serve another profile.
+	skey := key
+	if prof != nil {
+		skey = profileKey(key, prof.ID)
+	}
+	if msg := r.cache.Get(skey, req.Id); msg != nil {
 		mCache.Inc("hit")
 		v.action, v.reason = "forward", forwardReason("cache")
 		return msg
@@ -243,10 +259,29 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 
 	mCache.Inc("miss")
 
-	// Single in-flight upstream fetch per key (PLAN.md M0, recovery).
-	do := isDO(req)
-	res, _, _ := r.sf.Do(key, func() (any, error) {
-		return r.forward(&q, do), nil
+	// Single in-flight upstream fetch per key (PLAN.md M0, recovery). The
+	// closure returns the raw upstream answer; per-profile post-processing
+	// happens for each caller below.
+	o := upstreamOpts{
+		client: clientIP(c.addr),
+	}
+	var opts policy.Options
+	if prof != nil {
+		opts = prof.Options
+		ups, err := opts.Upstreams()
+		if err != nil {
+			// A broken per-profile upstream list falls back to the server's
+			// resolvers rather than failing every query; normalization makes
+			// this hard to hit, but bad config must not become an outage.
+			r.debugf("resolver: profile %d upstream %q: %v (using server default)", prof.ID, opts.Upstream, err)
+		} else {
+			o.ups = ups
+		}
+		o.ecs = opts.ECS
+		o.do = isDO(req) && !opts.DisableDNSSEC
+	}
+	res, _, _ := r.sf.Do(skey, func() (any, error) {
+		return r.forward(&q, o), nil
 	})
 	up, _ := res.(*dns.Msg)
 	if up == nil {
@@ -258,12 +293,14 @@ func (r *Resolver) decide(req *dns.Msg, c client, v *verdict) (resp *dns.Msg) {
 		return refusal(req, dns.RcodeServerFailure)
 	}
 
-	// Cache the upstream answer (TTL already clamped by forward) and serve it.
-	if ttl := minTTL(up); ttl > 0 {
-		r.cache.Put(key, up, ttl)
+	// Post-process with this caller's options (bypass TTL cap, rebind strip,
+	// CNAME flattening, DNS64/compat synthesis), then cache and serve it.
+	out := up.Copy()
+	r.postProcess(out, &q, o, opts)
+	if ttl := minTTL(out); ttl > 0 {
+		r.cache.Put(skey, out, ttl)
 	}
 	v.action, v.reason = "forward", forwardReason("upstream")
-	out := up.Copy()
 	out.Id = req.Id
 	return out
 }
@@ -475,19 +512,24 @@ func clientHost(addr string) string {
 
 // forward sends the question upstream, UDP first with TCP fallback on
 // truncation. A failing upstream is skipped and the next one tried, so one dead
-// resolver does not turn into SERVFAILs. On success the returned message already
-// has TTL clamps applied so the cache can reuse it directly.
-func (r *Resolver) forward(q *dns.Question, do bool) *dns.Msg {
-	req := new(dns.Msg)
-	req.Id = dns.Id()
-	req.RecursionDesired = true
-	req.Question = []dns.Question{*q}
-	req.SetEdns0(ednsSize, do)
+// resolver does not turn into SERVFAILs. On success the returned message has
+// TTL clamps applied so the cache can reuse it directly.
+func (r *Resolver) forward(q *dns.Question, o upstreamOpts) *dns.Msg {
+	ups := o.ups
+	if len(ups) == 0 {
+		ups = r.upstreams
+	}
+	return r.exchange(newRequest(q, o), q, ups)
+}
 
-	n := len(r.upstreams)
+// exchange round-robins a request over the given upstreams. It is also used by
+// CNAME flattening for the chain walks, so it takes the built request rather
+// than assembling one from a question.
+func (r *Resolver) exchange(req *dns.Msg, q *dns.Question, upstreams []string) *dns.Msg {
+	n := len(upstreams)
 	first := int(r.robin.Add(1))
 	for i := 0; i < n; i++ {
-		upstream := r.upstreams[(first+i)%n]
+		upstream := upstreams[(first+i)%n]
 		start := time.Now()
 		resp, _, err := r.udpClient.Exchange(req, upstream)
 		if err == nil && resp != nil && resp.Truncated {
@@ -613,43 +655,27 @@ func clientIP(clientAddr string) netip.Addr {
 	return zero
 }
 
-// redirectReply answers a REDIRECT with the exit's address. IPv4 gets an A
-// record pointing at the exit's gateway. Every other type gets an empty
-// NOERROR, so IPv6 cannot bypass the exit. The short TTL lets a changed exit
-// take effect quickly.
-func redirectReply(req *dns.Msg, q dns.Question, answerIP string) *dns.Msg {
-	resp := new(dns.Msg)
-	resp.SetReply(req)
-	ip := net.ParseIP(answerIP).To4()
-	if q.Qtype == dns.TypeA && ip != nil {
-		resp.Answer = append(resp.Answer, &dns.A{
-			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-			A:   ip,
-		})
-	}
-	return resp
-}
-
 // rewriteReply answers a REWRITE decision directly, M1 semantics:
-// target parses as IPv4 → A, IPv6 → AAAA, otherwise CNAME.
-func rewriteReply(req *dns.Msg, q dns.Question, target string) *dns.Msg {
+// target parses as IPv4 → A, IPv6 → AAAA, otherwise CNAME. The TTL is the
+// profile's redirect TTL so an edited rule takes effect quickly.
+func rewriteReply(req *dns.Msg, q dns.Question, target string, ttl uint32) *dns.Msg {
 	resp := new(dns.Msg)
 	resp.SetReply(req)
 	ip := net.ParseIP(target)
 	switch {
 	case ip != nil && ip.To4() != nil && q.Qtype == dns.TypeA:
 		resp.Answer = append(resp.Answer, &dns.A{
-			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
 			A:   ip.To4(),
 		})
 	case ip != nil && ip.To4() == nil && ip.To16() != nil && q.Qtype == dns.TypeAAAA:
 		resp.Answer = append(resp.Answer, &dns.AAAA{
-			Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+			Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
 			AAAA: ip,
 		})
 	default:
 		resp.Answer = append(resp.Answer, &dns.CNAME{
-			Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300},
+			Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: ttl},
 			Target: dns.Fqdn(strings.TrimSuffix(target, ".")),
 		})
 	}

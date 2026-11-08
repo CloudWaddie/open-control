@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import {
   ActivityIcon,
   ChevronsUpDownIcon,
+  FlaskConicalIcon,
   GaugeIcon,
   KeyRoundIcon,
   LogOutIcon,
@@ -10,6 +11,7 @@ import {
   NetworkIcon,
   ScrollTextIcon,
   ShieldIcon,
+  SmartphoneIcon,
   SunIcon,
   UserRoundIcon,
   WaypointsIcon,
@@ -55,6 +57,8 @@ import Logs from './views/Logs.jsx';
 import Profiles from './views/Profiles.jsx';
 import Endpoints from './views/Endpoints.jsx';
 import Accounts from './views/Accounts.jsx';
+import Setup from './views/Setup.jsx';
+import DomainTest from './views/DomainTest.jsx';
 import Tokens from './views/Tokens.jsx';
 import Audit from './views/Audit.jsx';
 
@@ -66,6 +70,7 @@ const NAV = [
     items: [
       { id: 'overview', label: 'Overview', icon: GaugeIcon, min: 'viewer', view: Overview },
       { id: 'logs', label: 'Query log', icon: ActivityIcon, min: 'viewer', view: Logs },
+      { id: 'domaintest', label: 'Domain test', icon: FlaskConicalIcon, min: 'viewer', view: DomainTest },
     ],
   },
   {
@@ -74,6 +79,12 @@ const NAV = [
       { id: 'profiles', label: 'Profiles', icon: ShieldIcon, min: 'viewer', view: Profiles },
       { id: 'endpoints', label: 'Endpoints', icon: NetworkIcon, min: 'viewer', view: Endpoints },
       { id: 'exits', label: 'Exit nodes', icon: WaypointsIcon, min: 'viewer', view: Exits },
+    ],
+  },
+  {
+    label: 'Setup',
+    items: [
+      { id: 'setup', label: 'Device setup', icon: SmartphoneIcon, min: 'viewer', view: Setup },
     ],
   },
   {

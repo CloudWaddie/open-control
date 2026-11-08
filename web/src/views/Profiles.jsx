@@ -10,12 +10,14 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import Filters from './profile/Filters.jsx';
 import Services from './profile/Services.jsx';
 import Rules from './profile/Rules.jsx';
+import Options from './profile/Options.jsx';
 import ResolverDialog from './ResolverDialog.jsx';
 
 const TABS = [
   { id: 'filters', label: 'Filters', view: Filters },
   { id: 'services', label: 'Services', view: Services },
   { id: 'rules', label: 'Custom rules', view: Rules },
+  { id: 'options', label: 'Options', view: Options },
 ];
 
 export default function Profiles({ me, params }) {

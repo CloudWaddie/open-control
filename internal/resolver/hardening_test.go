@@ -96,7 +96,7 @@ func TestForwardFailsOverToNextUpstream(t *testing.T) {
 	r := New(&cfg)
 	for i := 0; i < 2; i++ { // round-robin start alternates; both orders must work
 		q := dns.Question{Name: "ok.test.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
-		if resp := r.forward(&q, false); resp == nil || firstA(resp) != "192.0.2.53" {
+		if resp := r.forward(&q, upstreamOpts{}); resp == nil || firstA(resp) != "192.0.2.53" {
 			t.Fatalf("attempt %d: no answer through the healthy upstream", i)
 		}
 	}

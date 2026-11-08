@@ -20,11 +20,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/miekg/dns"
 
 	"github.com/cloudwaddie/opencontrol/internal/catalog"
 	"github.com/cloudwaddie/opencontrol/internal/egress"
@@ -46,11 +49,12 @@ var roleRank = map[string]int{"viewer": 1, "operator": 2, "admin": 3}
 
 // Server holds the dependencies of the control API.
 type Server struct {
-	db      *sql.DB
-	reload  func()          // asks the resolver to recompile its snapshot
-	checker *egress.Checker // probes exit nodes on demand; nil disables /check
-	dataDir string          // where list and registry downloads are cached
-	setup   Setup           // public addresses shown on the setup page
+	db       *sql.DB
+	reload   func()                  // asks the resolver to recompile its snapshot
+	checker  *egress.Checker         // probes exit nodes on demand; nil disables /check
+	dataDir  string                  // where list and registry downloads are cached
+	setup    Setup                   // public addresses shown on the setup page
+	snapshot func() *policy.Snapshot // the resolver's live compiled state, for the domain test
 }
 
 // Setup describes how devices reach this server. Empty Host means the
@@ -79,6 +83,14 @@ type handler struct {
 // Handler returns the API mux plus the embedded UI. reload is called after
 // every committed write so changes take effect without a restart. checker may
 // be nil, in which case the on-demand exit check endpoint reports 501.
+// SetSnapshotSource hands the control plane the resolver's live snapshot so
+// the domain test can replay exactly what the resolver would decide.
+func SetSnapshotSource(h http.Handler, f func() *policy.Snapshot) {
+	if srv, ok := h.(*handler); ok {
+		srv.s.snapshot = f
+	}
+}
+
 func Handler(db *sql.DB, reload func(), checker *egress.Checker, dataDir string) http.Handler {
 	s := &Server{db: db, reload: reload, checker: checker, dataDir: dataDir}
 	mux := http.NewServeMux()
@@ -113,6 +125,7 @@ func Handler(db *sql.DB, reload func(), checker *egress.Checker, dataDir string)
 	mux.Handle("PUT /api/v1/profiles/{id}/filters", s.require("operator", s.setFilter))
 	mux.Handle("GET /api/v1/profiles/{id}/options", s.require("viewer", s.getOptions))
 	mux.Handle("PUT /api/v1/profiles/{id}/options", s.require("operator", s.setOptions))
+	mux.Handle("GET /api/v1/profiles/{id}/test", s.require("viewer", s.testDomain))
 	mux.Handle("PUT /api/v1/profiles/{id}/default", s.require("operator", s.setDefaultProfile))
 	mux.Handle("PATCH /api/v1/endpoints/{id}", s.require("operator", s.patchEndpoint))
 	mux.Handle("GET /api/v1/setup", s.require("viewer", s.getSetup))
@@ -419,6 +432,175 @@ func (s *Server) catalogServices(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- profile options ---
+
+// testDomain answers "what would the resolver do with this name?", using the
+// same EvaluateQuery the resolver runs and the answer shape the profile's
+// options would produce — without forwarding anything.
+func (s *Server) testDomain(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if s == nil || s.snapshot == nil {
+		writeErr(w, http.StatusServiceUnavailable, "resolver state is not available in this build")
+		return
+	}
+	snap := s.snapshot()
+	if snap == nil {
+		writeErr(w, http.StatusServiceUnavailable, "resolver state is not loaded yet")
+		return
+	}
+	prof := snap.Profile(id)
+	if prof == nil {
+		writeErr(w, http.StatusNotFound, "profile does not exist in the loaded resolver state")
+		return
+	}
+	qname := strings.TrimSpace(r.URL.Query().Get("qname"))
+	if qname == "" {
+		writeErr(w, http.StatusBadRequest, "qname is required")
+		return
+	}
+	qname = strings.TrimSuffix(qname, ".")
+	if _, valid := dns.IsDomainName(qname); !valid {
+		writeErr(w, http.StatusBadRequest, "qname is not a valid domain name")
+		return
+	}
+	qname += "."
+
+	qtypeName := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("qtype")))
+	if qtypeName == "" {
+		qtypeName = "A"
+	}
+	qtype, known := dns.StringToType[qtypeName]
+	if !known {
+		writeErr(w, http.StatusBadRequest, "unknown record type "+qtypeName)
+		return
+	}
+
+	opts := prof.Options
+	d := snap.EvaluateQuery(prof, qname, qtype, time.Now())
+	if d.Reason == "paused" {
+		d.Action = policy.ActionForward // a paused profile lets everything through
+	}
+	out := TestResult{
+		Qname:  strings.TrimSuffix(qname, "."),
+		Qtype:  qtypeName,
+		Action: actionName(d.Action),
+		Reason: d.Reason,
+		Target: d.Target,
+	}
+	if ex := d.ExitName; ex != "" {
+		out.ExitName, out.ExitHealthy = ex, d.ExitHealthy
+	}
+	switch d.Action {
+	case policy.ActionBlock:
+		out.Answer, out.AnswerStyle = describeBlock(prof.Options, qtype, qtypeName)
+	case policy.ActionRewrite:
+		out.Answer = describeRewrite(d.Target, qtype, qtypeName)
+	case policy.ActionRedirect:
+		out.Answer = describeRedirect(d.Target, prof.Options, qtype, qtypeName)
+	default:
+		out.Answer = "Normal answer from " + describeUpstream(opts)
+		out.AnswerStyle = "forward"
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// actionName is the lowercase action word the query log uses.
+func actionName(a policy.Action) string {
+	switch a {
+	case policy.ActionBlock:
+		return "block"
+	case policy.ActionRewrite:
+		return "rewrite"
+	case policy.ActionRedirect:
+		return "redirect"
+	default:
+		return "forward"
+	}
+}
+
+// TestResult is one domain-test lookup: the decision plus, in Control D
+// fashion, the exact reply the client would receive.
+type TestResult struct {
+	Qname       string `json:"qname"`
+	Qtype       string `json:"qtype"`
+	Action      string `json:"action"` // block | rewrite | redirect | forward
+	Reason      string `json:"reason"` // rule/list/service id that decided it
+	Target      string `json:"target,omitempty"`
+	ExitName    string `json:"exit_name,omitempty"`
+	ExitHealthy bool   `json:"exit_healthy,omitempty"`
+	Answer      string `json:"answer"`
+	AnswerStyle string `json:"answer_style,omitempty"` // nxdomain | zero | nodata | refused | custom | forward | rewrite | redirect
+}
+
+func describeBlock(o policy.Options, qtype uint16, name string) (string, string) {
+	switch o.BlockResponse {
+	case "refused":
+		return "REFUSED", "refused"
+	case "nodata":
+		return "NODATA — empty answer", "nodata"
+	case "zero":
+		switch qtype {
+		case dns.TypeA:
+			return "0.0.0.0", "zero"
+		case dns.TypeAAAA:
+			return "::", "zero"
+		}
+		return "NODATA — empty answer (no " + name + " carries 0.0.0.0)", "zero"
+	case "custom":
+		switch qtype {
+		case dns.TypeA:
+			if o.BlockIPv4 != "" {
+				return o.BlockIPv4, "custom"
+			}
+		case dns.TypeAAAA:
+			if o.BlockIPv6 != "" {
+				return o.BlockIPv6, "custom"
+			}
+		}
+		return "NODATA — empty answer (no " + name + " address configured)", "custom"
+	default:
+		return "NXDOMAIN", "nxdomain"
+	}
+}
+
+func describeRewrite(target string, qtype uint16, name string) string {
+	if ip := net.ParseIP(target); ip != nil {
+		ip4 := ip.To4()
+		switch {
+		case ip4 != nil && qtype == dns.TypeA:
+			return ip4.String()
+		case ip4 == nil && ip.To16() != nil && qtype == dns.TypeAAAA:
+			return ip.String()
+		}
+		return "NODATA — rewrite target has no " + name + " address"
+	}
+	if qtype == dns.TypeCNAME || qtype == dns.TypeA || qtype == dns.TypeAAAA {
+		return "CNAME " + target
+	}
+	return "CNAME " + target
+}
+
+func describeRedirect(target string, opts policy.Options, qtype uint16, name string) string {
+	switch qtype {
+	case dns.TypeA:
+		return target + " (exit answer)"
+	case dns.TypeAAAA:
+		if opts.CompatMode {
+			return "AAAA under the exit (compat mode synthesis)"
+		}
+		return "NODATA — no IPv6 answer, so IPv6 clients cannot bypass the exit"
+	}
+	return "NODATA for " + name
+}
+
+func describeUpstream(o policy.Options) string {
+	if u, err := o.Upstreams(); err == nil && len(u) > 0 {
+		return strings.Join(u, ", ")
+	}
+	return "this server's upstreams"
+}
 
 func (s *Server) getOptions(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
