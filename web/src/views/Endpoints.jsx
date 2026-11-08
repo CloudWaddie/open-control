@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
-import { KeyRoundIcon, NetworkIcon, PlusIcon, RotateCwIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { KeyRoundIcon, NetworkIcon, PlusIcon, RotateCwIcon, Trash2Icon } from 'lucide-react';
 import { api, can } from '../api.js';
-import { Confirm, EmptyState, ErrorLine, Mono, PageHeader, SecretValue, SimpleSelect, TableSkeleton } from '../ui.jsx';
+import { Confirm, EmptyState, ErrorLine, Mono, PageHeader, SimpleSelect, TableSkeleton } from '../ui.jsx';
+import ResolverDialog from './ResolverDialog.jsx';
 import { Button } from '@/components/ui/button';
-import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
@@ -12,15 +13,17 @@ export default function Endpoints({ me }) {
   const [endpoints, setEndpoints] = useState(null);
   const [profiles, setProfiles] = useState([]);
   const [error, setError] = useState('');
-  const [created, setCreated] = useState(null); // { endpoint, token } shown once
+  const [viewing, setViewing] = useState(); // endpoint whose resolver-ID dialog is open
+  const [setup, setSetup] = useState(null);
   const [form, setForm] = useState({ name: '', profile_id: '', cidrs: '' });
   const writable = can(me.role, 'operator');
 
   const load = () =>
-    Promise.all([api('GET', '/endpoints'), api('GET', '/profiles')])
-      .then(([e, p]) => {
+    Promise.all([api('GET', '/endpoints'), api('GET', '/profiles'), api('GET', '/setup')])
+      .then(([e, p, s]) => {
         setEndpoints(e);
         setProfiles(p);
+        setSetup(s);
         setForm((f) => ({ ...f, profile_id: f.profile_id || String(p[0]?.id ?? '') }));
       })
       .catch((e) => setError(e.message));
@@ -44,7 +47,7 @@ export default function Endpoints({ me }) {
         profile_id: Number(form.profile_id),
         cidrs,
       });
-      setCreated(res);
+      setViewing(res.endpoint); // show the new resolver IDs right away
       setForm({ ...form, name: '', cidrs: '' });
       load();
     } catch (err) {
@@ -66,8 +69,17 @@ export default function Endpoints({ me }) {
   async function rotate(e) {
     setError('');
     try {
-      const res = await api('POST', `/endpoints/${e.id}/rotate`);
-      setCreated({ endpoint: e, token: res.token, rotated: true });
+      await api('POST', `/endpoints/${e.id}/rotate`);
+      setViewing(e); // the dialog re-reads the new token
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function showToken(e) {
+    try {
+      const { token } = await api('GET', `/endpoints/${e.id}/token`);
+      setViewing({ ...e, token });
     } catch (err) {
       setError(err.message);
     }
@@ -81,29 +93,7 @@ export default function Endpoints({ me }) {
       />
       <ErrorLine error={error} onDismiss={() => setError('')} />
 
-      {created && (
-        <Card className="ring-primary/40 bg-accent/40">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <KeyRoundIcon className="size-4 text-primary" />
-              {created.rotated ? `New token for ${created.endpoint.name}` : `${created.endpoint.name} created`}
-            </CardTitle>
-            <CardDescription>
-              {created.rotated && 'The old token no longer works. '}
-              Copy this token now; it is not shown again. Use it as the DoT SNI label (
-              <Mono>&lt;token&gt;.your.domain</Mono>) or in the DoH path (<Mono>/dns-query/&lt;token&gt;</Mono>).
-            </CardDescription>
-            <CardAction>
-              <Button variant="ghost" size="icon-sm" aria-label="Dismiss" onClick={() => setCreated(null)}>
-                <XIcon />
-              </Button>
-            </CardAction>
-          </CardHeader>
-          <CardContent>
-            <SecretValue value={created.token} />
-          </CardContent>
-        </Card>
-      )}
+      <ResolverDialog endpoint={viewing} setup={setup} onClose={() => setViewing(null)} />
 
       <Card>
         <CardContent>
@@ -147,6 +137,16 @@ export default function Endpoints({ me }) {
                     {writable && (
                       <TableCell>
                         <div className="flex justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="text-muted-foreground"
+                            aria-label={`Show resolver IDs for ${e.name}`}
+                            title="Show resolver IDs"
+                            onClick={() => showToken(e)}
+                          >
+                            <KeyRoundIcon />
+                          </Button>
                           <Confirm
                             label="Rotate"
                             icon={<RotateCwIcon />}

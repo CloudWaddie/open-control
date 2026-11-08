@@ -34,10 +34,10 @@ func TestSnapshotAppliesListsAndServices(t *testing.T) {
 	}
 	org, _ := DefaultOrgID(db)
 
-	if _, err := AddBlocklistSource(db, org, srv.URL+"/list", "hosts"); err != nil {
+	if _, err := AddBlocklistSource(db, org, srv.URL+"/list", "hosts", 0); err != nil {
 		t.Fatal(err)
 	}
-	exitID, err := AddExitNode(db, org, "fra", "wireguard", "203.0.113.5:51820", "10.77.0.1")
+	exitID, err := AddExitNode(db, org, "fra", ExitSpec{Kind: "wireguard", Address: "203.0.113.5:51820", AnswerIP: "10.77.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -36,6 +36,7 @@ type Decision struct {
 	ExitID      int64  // REDIRECT: the exit node chosen
 	ExitName    string // REDIRECT: its name, for logs
 	ExitHealthy bool   // REDIRECT: false means the resolver should fall back to forwarding
+	ExitIPv6    string // REDIRECT: the exit's IPv6 answer, if it has one
 }
 
 // Engine is the M0 stub: everything forwards, no lists loaded yet.

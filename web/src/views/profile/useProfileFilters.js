@@ -8,11 +8,17 @@ export function useProfileFilters(profileId) {
   const [error, setError] = useState('');
   const [pending, setPending] = useState({});
 
+  const reload = useCallback(
+    () =>
+      api('GET', `/profiles/${profileId}/filters`)
+        .then((list) => setEntries(Object.fromEntries(list.map((e) => [`${e.kind}:${e.ref}`, e]))))
+        .catch((e) => setError(e.message)),
+    [profileId],
+  );
+
   useEffect(() => {
-    api('GET', `/profiles/${profileId}/filters`)
-      .then((list) => setEntries(Object.fromEntries(list.map((e) => [`${e.kind}:${e.ref}`, e]))))
-      .catch((e) => setError(e.message));
-  }, [profileId]);
+    reload();
+  }, [reload]);
 
   const update = useCallback(
     async (kind, ref, change) => {
@@ -49,5 +55,5 @@ export function useProfileFilters(profileId) {
     [profileId],
   );
 
-  return { entries, error, setError, pending, update };
+  return { entries, error, setError, pending, update, reload };
 }

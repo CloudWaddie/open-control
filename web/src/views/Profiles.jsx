@@ -10,6 +10,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import Filters from './profile/Filters.jsx';
 import Services from './profile/Services.jsx';
 import Rules from './profile/Rules.jsx';
+import ResolverDialog from './ResolverDialog.jsx';
 
 const TABS = [
   { id: 'filters', label: 'Filters', view: Filters },
@@ -44,16 +45,22 @@ export default function Profiles({ me, params }) {
 function ProfileIndex({ me, profiles, error, onCreated }) {
   const [name, setName] = useState('');
   const [createError, setCreateError] = useState('');
+  const [newEndpoint, setNewEndpoint] = useState(null); // { endpoint, token } of the profile just created
+  const [setup, setSetup] = useState(null);
   const writable = can(me.role, 'operator');
 
   async function create(e) {
     e.preventDefault();
     setCreateError('');
     try {
-      const p = await api('POST', '/profiles', { name: name.trim() });
+      const [p, s] = await Promise.all([
+        api('POST', '/profiles', { name: name.trim() }),
+        api('GET', '/setup'),
+      ]);
       setName('');
       await onCreated();
-      window.location.hash = `#/profiles/${p.id}/filters`;
+      setSetup(s);
+      setNewEndpoint({ ...p.endpoint, token: p.token }); // resolver IDs dialog; navigates on close
     } catch (err) {
       setCreateError(err.message);
     }
@@ -61,6 +68,16 @@ function ProfileIndex({ me, profiles, error, onCreated }) {
 
   return (
     <div className="flex flex-col gap-6">
+      {newEndpoint && (
+        <ResolverDialog
+          endpoint={newEndpoint}
+          setup={setup}
+          onClose={() => {
+            setNewEndpoint(null);
+            window.location.hash = `#/profiles/${newEndpoint.profile_id}/filters`;
+          }}
+        />
+      )}
       <PageHeader
         title="Profiles"
         description="A profile is a set of filters, services and rules. Each endpoint uses one profile."

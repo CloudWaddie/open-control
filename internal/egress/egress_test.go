@@ -39,19 +39,19 @@ func fakeSOCKS5(t *testing.T, reply []byte) string {
 
 func TestSOCKS5ProbeNeedsARealHandshake(t *testing.T) {
 	good := fakeSOCKS5(t, []byte{0x05, 0x00})
-	if h, err := Probe("socks5", good, time.Second); h != Healthy || err != nil {
+	if h, err := Probe("socks5", good, "", "", time.Second); h != Healthy || err != nil {
 		t.Errorf("real SOCKS5 proxy: %s %v, want healthy", h, err)
 	}
 
 	// Something listens on the port but does not speak SOCKS5.
 	imposter := fakeSOCKS5(t, []byte("HTTP/1.1 400 bad request\r\n"))
-	if h, _ := Probe("socks5", imposter, time.Second); h != Down {
+	if h, _ := Probe("socks5", imposter, "", "", time.Second); h != Down {
 		t.Errorf("non-SOCKS5 listener: %s, want down", h)
 	}
 
 	// SOCKS5 that demands authentication (0xFF = no acceptable method) is not usable here.
 	authOnly := fakeSOCKS5(t, []byte{0x05, 0xFF})
-	if h, _ := Probe("socks5", authOnly, time.Second); h != Down {
+	if h, _ := Probe("socks5", authOnly, "", "", time.Second); h != Down {
 		t.Errorf("auth-only SOCKS5: %s, want down", h)
 	}
 
@@ -59,16 +59,16 @@ func TestSOCKS5ProbeNeedsARealHandshake(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	closed := ln.Addr().String()
 	ln.Close()
-	if h, _ := Probe("socks5", closed, 500*time.Millisecond); h != Down {
+	if h, _ := Probe("socks5", closed, "", "", 500*time.Millisecond); h != Down {
 		t.Errorf("closed port: %s, want down", h)
 	}
 }
 
 func TestWireGuardIsUnknownNotHealthy(t *testing.T) {
-	if h, err := Probe("wireguard", "vpn.example.net:51820", time.Second); h != Unknown || err != nil {
+	if h, err := Probe("wireguard", "vpn.example.net:51820", "", "", time.Second); h != Unknown || err != nil {
 		t.Errorf("wireguard endpoint: %s %v, want unknown (cannot probe without a tunnel)", h, err)
 	}
-	if h, _ := Probe("wireguard", "no-port", time.Second); h != Down {
+	if h, _ := Probe("wireguard", "no-port", "", "", time.Second); h != Down {
 		t.Errorf("malformed wireguard endpoint: %s, want down", h)
 	}
 }
@@ -88,7 +88,7 @@ func TestCheckerNotifiesOnlyOnChange(t *testing.T) {
 	}
 	org, _ := store.DefaultOrgID(db)
 	good := fakeSOCKS5(t, []byte{0x05, 0x00})
-	id, err := store.AddExitNode(db, org, "vps", "socks5", good, "10.77.0.1")
+	id, err := store.AddExitNode(db, org, "vps", store.ExitSpec{Kind: "socks5", Address: good, AnswerIP: "10.77.0.1"})
 	if err != nil {
 		t.Fatal(err)
 	}

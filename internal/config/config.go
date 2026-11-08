@@ -45,6 +45,13 @@ type Config struct {
 	// TrustedProxies are reverse proxies whose X-Forwarded-For header is
 	// believed for the control API (rate limits, audit). Empty = none.
 	TrustedProxies []string `yaml:"trusted_proxies"`
+	// PublicHost is the name devices use to reach this server, e.g.
+	// dns.example.com. The setup page builds DoH/DoT addresses from it. DoT
+	// needs a wildcard DNS record and certificate (*.dns.example.com) because
+	// the endpoint token is the first label.
+	PublicHost    string `yaml:"public_host"`
+	PublicDoHPort int    `yaml:"public_doh_port"` // as seen by devices; default 443
+	PublicDoTPort int    `yaml:"public_dot_port"` // default 853
 
 	plainAllow []netip.Prefix
 	proxies    []netip.Prefix
@@ -74,6 +81,8 @@ func Default() Config {
 		DataDir:          "data",
 		PlainDNSAllow:    PrivateNetworks,
 		RateLimitQPS:     100,
+		PublicDoHPort:    443,
+		PublicDoTPort:    853,
 		Cache: CacheConfig{
 			MaxEntries: 65536,
 			MinTTL:     30,
@@ -108,6 +117,7 @@ func Load(path string) (*Config, error) {
 		"OC_SQLITE_PATH":    &cfg.SQLitePath,
 		"OC_DATA_DIR":       &cfg.DataDir,
 		"OC_METRICS_LISTEN": &cfg.MetricsListen,
+		"OC_PUBLIC_HOST":    &cfg.PublicHost,
 	}
 	for k, p := range str {
 		if v := os.Getenv(k); v != "" {
@@ -127,6 +137,8 @@ func Load(path string) (*Config, error) {
 	ints := map[string]*int{
 		"OC_LOG_RETENTION_DAYS": &cfg.LogRetentionDays,
 		"OC_RATE_LIMIT_QPS":     &cfg.RateLimitQPS,
+		"OC_PUBLIC_DOH_PORT":    &cfg.PublicDoHPort,
+		"OC_PUBLIC_DOT_PORT":    &cfg.PublicDoTPort,
 	}
 	for k, p := range ints {
 		if v := os.Getenv(k); v != "" {

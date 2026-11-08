@@ -43,18 +43,21 @@ type Profile struct {
 	ServiceAllow    []ListRef      // services that bypass every list
 	ServiceBlock    []ListRef      // blocked services
 	ServiceRedirect []ServiceRoute // services sent through an exit
+
+	Options   Options  // resolver settings (block response, safe search, …)
+	Upstreams []string // nil = server default
 }
 
 // ListRef is a shared compiled list plus the reason prefix logged on a match,
 // e.g. "filter:ads" or "service:tiktok".
 type ListRef struct {
-	Set    *DomainSet
+	Set    Matcher
 	Reason string
 }
 
 // ServiceRoute sends a whole service through an exit node.
 type ServiceRoute struct {
-	Set    *DomainSet
+	Set    Matcher
 	Reason string
 	Exit   *Exit
 }
@@ -62,10 +65,11 @@ type ServiceRoute struct {
 // Exit is an egress node a redirect rule can point at. Healthy is the state
 // last recorded by the health checker: false means "skip, forward instead".
 type Exit struct {
-	ID       int64
-	Name     string
-	AnswerIP string
-	Healthy  bool
+	ID         int64
+	Name       string
+	AnswerIP   string
+	AnswerIPv6 string // optional; used for AAAA in compatibility mode
+	Healthy    bool
 }
 
 type RewriteRecord struct {
@@ -77,6 +81,7 @@ type Snapshot struct {
 	endpoints []*Endpoint
 	byToken   map[string]*Endpoint
 	profiles  map[int64]*Profile
+	def       *Profile
 }
 
 // NewSnapshot assembles an immutable snapshot from loaded endpoints/profiles.
@@ -104,9 +109,17 @@ func (s *Snapshot) ProfileForEndpoint(id int64) *Profile {
 	return s.profiles[id]
 }
 
-// DefaultProfile returns the smallest-ID profile — the seeded org default.
-// Used when no endpoint rule matches the client IP.
+// SetDefault picks the profile used when no endpoint matches the client.
+func (s *Snapshot) SetDefault(profileID int64) {
+	s.def = s.profiles[profileID]
+}
+
+// DefaultProfile returns the profile for clients that match no endpoint: the
+// one set with SetDefault, else the smallest-ID profile (the seeded default).
 func (s *Snapshot) DefaultProfile() *Profile {
+	if s.def != nil {
+		return s.def
+	}
 	var best *Profile
 	for _, p := range s.profiles {
 		if best == nil || p.ID < best.ID {
@@ -122,7 +135,7 @@ func (s *Snapshot) Summary() string {
 	for _, p := range s.profiles {
 		defaults += p.Block.Size() + p.Allow.Size() + len(p.Rewrites)
 	}
-	lists := map[*DomainSet]bool{}
+	lists := map[Matcher]bool{}
 	for _, p := range s.profiles {
 		for _, l := range p.Lists {
 			lists[l.Set] = true

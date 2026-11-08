@@ -92,8 +92,8 @@ const pages = [
   { id: 'services', path: `profiles/${kidsId}/services` },
   { id: 'rules', path: `profiles/${kidsId}/rules` },
   { id: 'endpoints', path: 'endpoints' },
-  { id: 'blocklists', path: 'blocklists' },
   { id: 'exits', path: 'exits' },
+  { id: 'accounts', path: 'accounts' },
   { id: 'tokens', path: 'tokens' },
   { id: 'audit', path: 'audit' },
 ];

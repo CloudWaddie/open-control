@@ -6,8 +6,9 @@ import (
 	"testing"
 )
 
-// Endpoint tokens are DoH/DoT credentials: only their hash may be stored, and
-// rotation must revoke the old one at once.
+// Endpoint tokens authenticate a DoH/DoT client: the hash is authoritative
+// for lookup, the plaintext is kept alongside so the dashboard can show it
+// again, and rotation revokes the old one at once.
 func TestEndpointTokenIsStoredHashedAndRotates(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "ep.db"))
 	if err != nil {
@@ -35,6 +36,17 @@ func TestEndpointTokenIsStoredHashedAndRotates(t *testing.T) {
 	}
 	if stored != HashToken(token) {
 		t.Fatal("stored value is not the token's hash")
+	}
+	var viewable string
+	if err := db.QueryRow(`SELECT token_plain FROM endpoints WHERE id = ?`, id).Scan(&viewable); err != nil {
+		t.Fatal(err)
+	}
+	if viewable != token {
+		t.Fatal("token cannot be viewed again")
+	}
+	got, err := GetEndpointToken(db, org, id)
+	if err != nil || got != token {
+		t.Fatalf("GetEndpointToken: %q %v", got, err)
 	}
 
 	snap, err := LoadSnapshot(db, t.TempDir(), policy.FetchNone)
@@ -64,5 +76,8 @@ func TestEndpointTokenIsStoredHashedAndRotates(t *testing.T) {
 	other, _ := CreateOrg(db, "elsewhere")
 	if _, err := RotateEndpointToken(db, other, id); err == nil {
 		t.Error("rotated an endpoint belonging to another org")
+	}
+	if _, err := GetEndpointToken(db, other, id); err == nil {
+		t.Error("revealed an endpoint token belonging to another org")
 	}
 }

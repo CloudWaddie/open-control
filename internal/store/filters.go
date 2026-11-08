@@ -51,6 +51,9 @@ func SetProfileFilter(db DBTX, org, profileID int64, f ProfileFilter) error {
 	if err := profileInOrg(db, org, profileID); err != nil {
 		return err
 	}
+	if err := checkUnlocked(db, profileID); err != nil {
+		return err
+	}
 	if f.State == "off" {
 		_, err := db.Exec(`DELETE FROM profile_filters WHERE profile_id = ? AND kind = ? AND ref = ?`,
 			profileID, f.Kind, f.Ref)
@@ -65,7 +68,7 @@ func SetProfileFilter(db DBTX, org, profileID int64, f ProfileFilter) error {
 			return fmt.Errorf("unknown filter %q", f.Ref)
 		}
 		if f.Level == "" {
-			f.Level = flt.Levels[0].ID
+			f.Level = flt.DefaultLevel()
 		}
 		if !flt.HasLevel(f.Level) {
 			return fmt.Errorf("filter %s has no level %q", f.Ref, f.Level)

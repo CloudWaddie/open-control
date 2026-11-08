@@ -42,6 +42,7 @@ Usage:
   opencontrol addlist URL [FORMAT]      subscribe to a blocklist (hosts|dnsmasq|adguard)
   opencontrol addorg NAME               create an org (tenant), prints its id
   opencontrol addtoken NAME ROLE [ORG]  mint an API token (admin|operator|viewer) for ORG
+  opencontrol adduser NAME ROLE PASSWORD  create a dashboard account (USERNAME/ROLE/PASSWORD)
                                         (default: the default org), printed once
   opencontrol addprofile NAME           create a profile, prints its id
   opencontrol addendpoint NAME PROFILE_ID CIDR[,CIDR...]
@@ -140,6 +141,18 @@ func main() {
 		}
 		log.Printf("addtoken: %s (%s) for org %s — copy it now, it is not shown again", flag.Arg(1), flag.Arg(2), orgName)
 		fmt.Println(tok)
+	case "adduser":
+		if flag.NArg() < 4 {
+			fmt.Fprint(os.Stderr, "usage: opencontrol adduser NAME ROLE PASSWORD\n")
+			os.Exit(2)
+		}
+		_, db := openDB(*cfgPath)
+		defer db.Close()
+		u, err := store.CreateUser(db, defaultOrg(db), flag.Arg(1), flag.Arg(3), flag.Arg(2))
+		if err != nil {
+			log.Fatalf("adduser: %v", err)
+		}
+		log.Printf("adduser: %s (%s) can sign in with the given password", u.Name, u.Role)
 	case "addorg":
 		if flag.NArg() < 2 {
 			fmt.Fprint(os.Stderr, "usage: opencontrol addorg NAME\n")
@@ -289,9 +302,14 @@ func runServe(cfgPath string) {
 	}()
 
 	// Control plane. Writes reload the snapshot immediately.
+	handler := control.Handler(db, func() { reload(false) }, checker, cfg.DataDir)
+	control.SetSetup(handler, control.Setup{
+		Host: cfg.PublicHost, DoHPort: cfg.PublicDoHPort, DoTPort: cfg.PublicDoTPort,
+		DoH: cfg.DoHListen != "", DoT: cfg.DoTListen != "",
+	})
 	api := &http.Server{
 		Addr:              cfg.APIListen,
-		Handler:           control.Handler(db, func() { reload(false) }, checker, cfg.DataDir),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -442,7 +460,7 @@ func runAddList(cfgPath string, args []string) {
 	if len(args) > 1 {
 		format = args[1]
 	}
-	if _, err := store.AddBlocklistSource(db, defaultOrg(db), url, format); err != nil {
+	if _, err := store.AddBlocklistSource(db, defaultOrg(db), url, format, 0); err != nil {
 		log.Fatalf("addlist: %v", err)
 	}
 	log.Printf("addlist: %s (%s) subscribed — run 'opencontrol sync' to fetch now", url, format)
