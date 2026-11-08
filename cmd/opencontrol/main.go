@@ -307,6 +307,7 @@ func runServe(cfgPath string) {
 		Host: cfg.PublicHost, DoHPort: cfg.PublicDoHPort, DoTPort: cfg.PublicDoTPort,
 		DoH: cfg.DoHListen != "", DoT: cfg.DoTListen != "",
 	})
+	control.SetSnapshotSource(handler, r.Snapshot)
 	api := &http.Server{
 		Addr:              cfg.APIListen,
 		Handler:           handler,

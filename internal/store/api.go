@@ -49,6 +49,10 @@ type Endpoint struct {
 	ProfileID int64    `json:"profile_id"`
 	Name      string   `json:"name"`
 	CIDRs     []string `json:"cidrs"`
+	// Token is the endpoint's DoH/DoT resolver ID. It is a device
+	// identifier, not a credential, so it is listed again any time
+	// (migration 0008 keeps the plaintext alongside the auth hash).
+	Token string `json:"token,omitempty"`
 }
 
 type Blocklist struct {
@@ -128,7 +132,7 @@ func DeleteRule(db DBTX, org, id int64) error {
 }
 
 func ListEndpoints(db DBTX, org int64) ([]Endpoint, error) {
-	rows, err := db.Query(`SELECT id, profile_id, name, allowed_source_ips FROM endpoints WHERE org_id = ? ORDER BY id`, org)
+	rows, err := db.Query(`SELECT id, profile_id, name, allowed_source_ips, token_plain FROM endpoints WHERE org_id = ? ORDER BY id`, org)
 	if err != nil {
 		return nil, err
 	}
@@ -136,11 +140,12 @@ func ListEndpoints(db DBTX, org int64) ([]Endpoint, error) {
 	out := []Endpoint{}
 	for rows.Next() {
 		var e Endpoint
-		var raw string
-		if err := rows.Scan(&e.ID, &e.ProfileID, &e.Name, &raw); err != nil {
+		var raw, token string
+		if err := rows.Scan(&e.ID, &e.ProfileID, &e.Name, &raw, &token); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(raw), &e.CIDRs)
+		e.Token = token
 		out = append(out, e)
 	}
 	return out, rows.Err()

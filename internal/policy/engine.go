@@ -109,6 +109,12 @@ func (s *Snapshot) ProfileForEndpoint(id int64) *Profile {
 	return s.profiles[id]
 }
 
+// Profile returns a compiled profile by its store ID, so tools like the
+// domain test can replay the serving state against an API-side profile ID.
+func (s *Snapshot) Profile(id int64) *Profile {
+	return s.profiles[id]
+}
+
 // SetDefault picks the profile used when no endpoint matches the client.
 func (s *Snapshot) SetDefault(profileID int64) {
 	s.def = s.profiles[profileID]
